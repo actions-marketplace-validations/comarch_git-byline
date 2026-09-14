@@ -40,6 +40,14 @@ func TestParseToolHooks(t *testing.T) {
 			payload: `{"tool_name":"ApplyPatch","tool_input":{"patch":"*** Begin Patch\n*** Update File: a.go\n*** Move to: b.go\n*** End Patch\n"}}`,
 		},
 		{
+			name: "droid patch in input field", preset: "droid", author: model.AuthorAI, handled: true, paths: 1,
+			payload: `{"tool_name":"ApplyPatch","tool_input":{"input":"*** Begin Patch\n*** Update File: a.go\n*** End Patch\n"}}`,
+		},
+		{
+			name: "droid patch without body", preset: "droid", author: model.AuthorAI,
+			payload: `{"tool_name":"ApplyPatch","tool_input":{"content":"x"}}`, wantErr: true,
+		},
+		{
 			name: "unified patch", preset: "portable-copilot", author: model.AuthorAI, handled: true, paths: 1,
 			payload: `{"toolName":"apply_patch","toolArgs":{"patch":"--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-old\n+new\n"}}`,
 		},
@@ -159,6 +167,7 @@ func TestParsePortableHooks(t *testing.T) {
 		{"grok", `{"file_paths":["g.go","h.go"]}`, []string{"g.go", "h.go"}},
 		{"copilot", `{"sessionId":"s","toolName":"apply_patch","toolArgs":"{\"filePath\":\"i.go\"}"}`, []string{"i.go"}},
 		{"claude", `{"conversation_id":"c","edited_filepaths":["j.go"]}`, []string{"j.go"}},
+		{"factory", `{"tool_name":"ApplyPatch","model":"m","tool_input":{"input":"*** Begin Patch\n*** Update File: k.go\n*** End Patch\n"}}`, []string{"k.go"}},
 	}
 	for _, test := range tests {
 		test := test
@@ -176,6 +185,58 @@ func TestParsePortableHooks(t *testing.T) {
 			}
 		})
 	}
+	t.Run("patch-like input outside ApplyPatch is not a patch body", func(t *testing.T) {
+		t.Parallel()
+		payload := `{"toolName":"write_notes","toolArgs":{"input":"*** Begin Patch\n*** Update File: stray.go\n*** End Patch\n"}}`
+		event, handled, err := Parse("portable-factory", model.AuthorAI, strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if handled || len(event.Paths) != 0 {
+			t.Fatalf("event = %+v, handled = %t", event, handled)
+		}
+	})
+	t.Run("applypatch spellings use input as patch body", func(t *testing.T) {
+		t.Parallel()
+		for tool, path := range map[string]string{
+			"apply_patch":        "snake.go",
+			"factory.ApplyPatch": "qualified.go",
+		} {
+			tool, path := tool, path
+			t.Run(tool, func(t *testing.T) {
+				t.Parallel()
+				payload := `{"toolName":"` + tool +
+					`","toolArgs":{"input":"*** Begin Patch\n*** Update File: ` + path + `\n*** End Patch\n"}}`
+				event, handled, err := Parse("portable-factory", model.AuthorAI, strings.NewReader(payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !handled || len(event.Paths) != 1 || event.Paths[0] != path {
+					t.Fatalf("event = %+v, handled = %t", event, handled)
+				}
+			})
+		}
+	})
+	t.Run("applypatch without body fails", func(t *testing.T) {
+		t.Parallel()
+		payload := `{"tool_name":"ApplyPatch","tool_input":{"foo":"bar"}}`
+		event, handled, err := Parse("portable-factory", model.AuthorAI, strings.NewReader(payload))
+		if err == nil || handled || len(event.Paths) != 0 {
+			t.Fatalf("event = %+v, handled = %t, error = %v", event, handled, err)
+		}
+	})
+	t.Run("factory applypatch validates body with a path", func(t *testing.T) {
+		t.Parallel()
+		for _, payload := range []string{
+			`{"tool_name":"ApplyPatch","tool_input":{"filePath":"a.go"}}`,
+			`{"tool_name":"ApplyPatch","tool_input":{"filePath":"a.go","input":"bad"}}`,
+		} {
+			event, handled, err := Parse("portable-factory", model.AuthorAI, strings.NewReader(payload))
+			if err == nil || handled || len(event.Paths) != 0 {
+				t.Fatalf("payload = %s, event = %+v, handled = %t, error = %v", payload, event, handled, err)
+			}
+		}
+	})
 	for _, agent := range portableAgents {
 		agent := agent
 		t.Run("shell-"+agent, func(t *testing.T) {

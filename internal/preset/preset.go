@@ -117,6 +117,7 @@ func parseToolHook(agent string, explicit model.Author, data []byte, allowed []s
 	var toolInput struct {
 		FilePath string `json:"file_path"`
 		Patch    string `json:"patch"`
+		Input    string `json:"input"`
 	}
 	if err := json.Unmarshal(rawToolInput, &toolInput); err != nil {
 		return Event{}, false, fmt.Errorf("decode tool_input: %w", err)
@@ -124,7 +125,8 @@ func parseToolHook(agent string, explicit model.Author, data []byte, allowed []s
 	var paths []string
 	if tool == "ApplyPatch" {
 		var err error
-		paths, err = patchPaths(toolInput.Patch)
+		// Factory sends the ApplyPatch body in input; patch covers other surfaces.
+		paths, err = patchPaths(firstValue(toolInput.Patch, toolInput.Input))
 		if err != nil {
 			return Event{}, false, err
 		}
@@ -328,6 +330,9 @@ func parsePortableHook(agent string, explicit model.Author, data []byte) (Event,
 		readOnlyOperation(firstValue(payload.ToolName, payload.ToolNameCamel)) {
 		return Event{}, false, nil
 	}
+	applyPatch := applyPatchTool(payload.ToolName, payload.ToolNameCamel)
+	requirePatchBody := agent == "factory" && applyPatch
+	patchBodyFound := false
 	paths := []string{payload.FilePath, payload.FilePathCamel, payload.File, payload.Path}
 	paths = append(paths, payload.FilePaths...)
 	paths = append(paths, payload.FilePathsCamel...)
@@ -351,6 +356,7 @@ func parsePortableHook(agent string, explicit model.Author, data []byte) (Event,
 			File                 string   `json:"file"`
 			Path                 string   `json:"path"`
 			Patch                string   `json:"patch"`
+			Input                string   `json:"input"`
 			FilePaths            []string `json:"file_paths"`
 			FilePathsCamel       []string `json:"filePaths"`
 			EditedFilepaths      []string `json:"edited_filepaths"`
@@ -366,9 +372,17 @@ func parsePortableHook(agent string, explicit model.Author, data []byte) (Event,
 		paths = append(paths, input.EditedFilepaths...)
 		paths = append(paths, input.EditedFilepathsCamel...)
 		paths = append(paths, input.Files...)
-		if input.Patch != "" {
-			patchFiles, err := patchPaths(input.Patch)
-			if err != nil && len(uniquePaths(paths)) == 0 {
+		// Factory puts the ApplyPatch body in input; patch covers other surfaces.
+		// Only ApplyPatch tools may use input as the patch body: ordinary tools
+		// can carry unrelated text in input that is not a patch.
+		patch := input.Patch
+		if applyPatch {
+			patch = firstValue(input.Patch, input.Input)
+		}
+		if patch != "" {
+			patchBodyFound = true
+			patchFiles, err := patchPaths(patch)
+			if err != nil && (requirePatchBody || len(uniquePaths(paths)) == 0) {
 				return Event{}, false, err
 			}
 			if err == nil {
@@ -376,8 +390,14 @@ func parsePortableHook(agent string, explicit model.Author, data []byte) (Event,
 			}
 		}
 	}
+	if requirePatchBody && !patchBodyFound {
+		return Event{}, false, errors.New("patch is missing")
+	}
 	paths = uniquePaths(paths)
 	if len(paths) == 0 {
+		if applyPatch {
+			return Event{}, false, errors.New("patch is missing")
+		}
 		return Event{}, false, nil
 	}
 	event := Event{Kind: model.CheckpointKindEdit, Type: explicit, Paths: paths, EventID: eventID}
@@ -440,6 +460,25 @@ func isShellOperation(values ...string) bool {
 		}
 		if strings.Contains(value, "bash") || strings.Contains(value, "command") ||
 			strings.Contains(value, "shell") || strings.Contains(value, "terminal") {
+			return true
+		}
+	}
+	return false
+}
+
+// applyPatchTool reports whether a tool name refers to the ApplyPatch tool.
+// It accepts prefixed and separated spellings like factory.ApplyPatch and
+// apply_patch, mirroring how surfaces name the tool.
+func applyPatchTool(values ...string) bool {
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if index := strings.LastIndex(value, "."); index >= 0 {
+			value = value[index+1:]
+		}
+		value = strings.ReplaceAll(value, "_", "")
+		value = strings.ReplaceAll(value, "-", "")
+		value = strings.ReplaceAll(value, " ", "")
+		if value == "applypatch" {
 			return true
 		}
 	}
