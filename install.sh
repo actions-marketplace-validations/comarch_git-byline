@@ -7,11 +7,18 @@ version="${GIT_BYLINE_VERSION:-latest}"
 bin_dir="${GIT_BYLINE_BIN_DIR:-$HOME/.local/bin}"
 install_git_hook="${GIT_BYLINE_INSTALL_GIT_HOOK:-1}"
 install_agent_hooks="${GIT_BYLINE_INSTALL_AGENT_HOOKS:-1}"
+install_git_template="${GIT_BYLINE_INSTALL_GIT_TEMPLATE:-0}"
+
+install_template_hooks() {
+	if [ "$install_git_template" != "0" ]; then
+		"$target" install-hooks --agent none --git --template
+	fi
+}
 
 usage() {
 	cat <<'EOF'
 Usage: install.sh [--version VERSION] [--bin-dir DIR] [--no-git-hook]
-                  [--no-agent-hooks]
+                  [--no-agent-hooks] [--git-template]
 
 Install a checksum-verified git-byline release for Linux or macOS.
 
@@ -22,6 +29,11 @@ The installer detects the coding agents present on this machine. Agents that
 git-byline can configure on its own get a user-level hook, which covers every
 repository. For the remaining agents it prints the one command that adds their
 hook to a project. Pass --no-agent-hooks to skip detection entirely.
+
+Pass --git-template to manage Git hooks in the git-byline Git template
+directory, so every new git init and git clone is attributed. The template
+replaces Git's default one, so git-byline also writes the stock
+info/exclude and description files it normally provides.
 EOF
 }
 
@@ -49,6 +61,10 @@ while [ "$#" -gt 0 ]; do
 		;;
 	--no-agent-hooks)
 		install_agent_hooks=0
+		shift
+		;;
+	--git-template)
+		install_git_template=1
 		shift
 		;;
 	-h | --help)
@@ -93,6 +109,7 @@ if [ -f "$target" ]; then
 	*) ;;
 	esac
 	if [ "$current" = "git-byline $version" ]; then
+		install_template_hooks
 		printf 'git-byline %s is already installed at %s\n' "$version" "$target"
 		exit 0
 	fi
@@ -189,6 +206,10 @@ if [ "$install_git_hook" != "0" ] &&
 	git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 	"$target" install-hooks --agent none --git --project
 fi
+
+# --git-template manages Git hooks in the git-byline Git template
+# directory, so every new git init and git clone is attributed.
+install_template_hooks
 
 if [ -n "$previous" ]; then
 	printf 'Updated git-byline %s to %s at %s\n' "$previous" "$version" "$target"
