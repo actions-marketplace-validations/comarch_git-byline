@@ -194,6 +194,66 @@ func TestPostRewriteDoesNotProjectChangedUnchangedPath(t *testing.T) {
 	}
 }
 
+func TestPostRewriteConflictResolvedHeadClearsBoundary(t *testing.T) {
+	t.Parallel()
+	root := testRepo(t)
+	write(t, root, "file.txt", "alpha\nbeta\ngamma\n")
+	base := commit(t, root, "base")
+	repo, err := gitcmd.Discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "file.txt", "alpha\nbeta-ai\ngamma\n")
+	feature := commit(t, root, "feature")
+	if _, err := Annotate(repo); err != nil {
+		t.Fatal(err)
+	}
+
+	// The feature commit replays onto a conflicting base and the conflict
+	// is resolved with content that matches neither side, so no source
+	// blob from the feature note survives on the rewritten commit.
+	git(t, root, "checkout", "-q", "-b", "other", base)
+	write(t, root, "file.txt", "alpha\nbeta-other\ngamma\n")
+	commit(t, root, "other")
+	write(t, root, "file.txt", "alpha\nbeta-resolved\ngamma\n")
+	resolved := commit(t, root, "resolved")
+
+	result, err := HandlePostRewrite(repo, strings.NewReader(feature+" "+resolved+"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := repo.ReadNote(resolved); err != nil || found {
+		t.Fatalf("conflict resolution created a note: %t, %v", found, err)
+	}
+	state, err := store.New(repo.GitDir).ReadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.LastAnnotatedCommit != "" || state.Pending.BaseCommit != "" {
+		t.Fatalf("boundary after unprojectable rewrite = %+v, want cleared", state)
+	}
+	cleared := false
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "cleared attribution boundary") {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("missing boundary clear warning: %v", result.Warnings)
+	}
+
+	// Attribution resumes on the next commit instead of failing the
+	// boundary note check forever.
+	write(t, root, "file.txt", "alpha\nbeta-resolved\ngamma-2\n")
+	next := commit(t, root, "next")
+	if _, err := Annotate(repo); err != nil {
+		t.Fatalf("annotate after recovery: %v", err)
+	}
+	if _, found, err := repo.ReadNote(next); err != nil || !found {
+		t.Fatalf("recovery note missing: %t, %v", found, err)
+	}
+}
+
 func TestReferenceTransactionRejectsInvalidTargetNote(t *testing.T) {
 	t.Parallel()
 	root := testRepo(t)
@@ -1148,52 +1208,56 @@ func TestReferenceTransactionKeepsPendingAcrossOrdinaryCommit(t *testing.T) {
 	for _, shape := range shapes {
 		t.Run(shape.name, func(t *testing.T) {
 			t.Parallel()
-			root := testRepo(t)
-			write(t, root, "base.txt", "base\n")
-			first := commit(t, root, "base")
-			repo, err := gitcmd.Discover(root)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Annotate(repo); err != nil {
-				t.Fatal(err)
-			}
-			// Partial commit: p1 is committed, p2 stays excluded with AI evidence.
-			write(t, root, "p1.txt", "p1\n")
-			write(t, root, "p2.txt", "p2\n")
-			now := time.Now()
-			if _, err := Capture(repo, preset.Event{Type: model.AuthorAI, Agent: "claude", Model: "m1", Session: "s1", Paths: []string{"p1.txt"}}, now); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Capture(repo, preset.Event{Type: model.AuthorAI, Agent: "claude", Model: "m1", Session: "s1", Paths: []string{"p2.txt"}}, now.Add(time.Second)); err != nil {
-				t.Fatal(err)
-			}
-			git(t, root, "add", "p1.txt")
-			git(t, root, "commit", "-m", "only p1")
-			second := strings.TrimSpace(git(t, root, "rev-parse", "HEAD"))
-			if _, err := HandleReferenceTransaction(repo, strings.NewReader(shape.input(first, second)), "committed"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Annotate(repo); err != nil {
-				t.Fatal(err)
-			}
-			git(t, root, "add", "p2.txt")
-			git(t, root, "commit", "-m", "p2 now")
-			third := strings.TrimSpace(git(t, root, "rev-parse", "HEAD"))
-			if _, err := HandleReferenceTransaction(repo, strings.NewReader(shape.input(second, third)), "committed"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Annotate(repo); err != nil {
-				t.Fatal(err)
-			}
-			after, err := Blame(repo, "p2.txt")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(after.Lines) != 1 || after.Lines[0].Attribution.Author != model.AuthorAI {
-				t.Fatalf("p2 attribution after second commit = %+v, want ai", after.Lines)
-			}
+			checkPendingKeptAcrossCommit(t, shape.input)
 		})
+	}
+}
+
+func checkPendingKeptAcrossCommit(t *testing.T, input func(old, new string) string) {
+	root := testRepo(t)
+	write(t, root, "base.txt", "base\n")
+	first := commit(t, root, "base")
+	repo, err := gitcmd.Discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Annotate(repo); err != nil {
+		t.Fatal(err)
+	}
+	// Partial commit: p1 is committed, p2 stays excluded with AI evidence.
+	write(t, root, "p1.txt", "p1\n")
+	write(t, root, "p2.txt", "p2\n")
+	now := time.Now()
+	if _, err := Capture(repo, preset.Event{Type: model.AuthorAI, Agent: "claude", Model: "m1", Session: "s1", Paths: []string{"p1.txt"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(repo, preset.Event{Type: model.AuthorAI, Agent: "claude", Model: "m1", Session: "s1", Paths: []string{"p2.txt"}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	git(t, root, "add", "p1.txt")
+	git(t, root, "commit", "-m", "only p1")
+	second := strings.TrimSpace(git(t, root, "rev-parse", "HEAD"))
+	if _, err := HandleReferenceTransaction(repo, strings.NewReader(input(first, second)), "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Annotate(repo); err != nil {
+		t.Fatal(err)
+	}
+	git(t, root, "add", "p2.txt")
+	git(t, root, "commit", "-m", "p2 now")
+	third := strings.TrimSpace(git(t, root, "rev-parse", "HEAD"))
+	if _, err := HandleReferenceTransaction(repo, strings.NewReader(input(second, third)), "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Annotate(repo); err != nil {
+		t.Fatal(err)
+	}
+	after, err := Blame(repo, "p2.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Lines) != 1 || after.Lines[0].Attribution.Author != model.AuthorAI {
+		t.Fatalf("p2 attribution after second commit = %+v, want ai", after.Lines)
 	}
 }
 
