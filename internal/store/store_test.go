@@ -48,6 +48,76 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDropCheckpointRecordsPreservesOtherLines(t *testing.T) {
+	t.Parallel()
+	value := New(t.TempDir())
+	if err := os.MkdirAll(value.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unknown := `{"version":9,"new_field":true}`
+	truncated := `{"version":1`
+	data := mustJSON(validCheckpoint(1)) + "\n" +
+		unknown + "\n" +
+		mustJSON(validCheckpoint(2)) + "\n" +
+		truncated
+	if err := os.WriteFile(value.CheckpointPath(), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := value.DropCheckpointRecords(nil); err != nil || dropped != 0 {
+		t.Fatalf("empty drop = %d, %v", dropped, err)
+	}
+	if dropped, err := value.DropCheckpointRecords(map[uint64]bool{99: true}); err != nil || dropped != 0 {
+		t.Fatalf("missing sequence drop = %d, %v", dropped, err)
+	}
+	dropped, err := value.DropCheckpointRecords(map[uint64]bool{2: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1", dropped)
+	}
+	want := mustJSON(validCheckpoint(1)) + "\n" + unknown + "\n" + truncated
+	got, err := os.ReadFile(value.CheckpointPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("checkpoint log = %q, want %q", got, want)
+	}
+	records, warnings, err := value.ReadCheckpoints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Seq != 1 || len(warnings) != 2 {
+		t.Fatalf("ReadCheckpoints() = %+v, %v", records, warnings)
+	}
+}
+
+func TestDropCheckpointRecordsEmptyAndInvalidLogs(t *testing.T) {
+	t.Parallel()
+	empty := New(t.TempDir())
+	if err := os.MkdirAll(empty.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(empty.CheckpointPath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := empty.DropCheckpointRecords(map[uint64]bool{1: true}); err != nil || dropped != 0 {
+		t.Fatalf("empty log drop = %d, %v", dropped, err)
+	}
+
+	invalid := New(t.TempDir())
+	if err := os.MkdirAll(invalid.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalid.CheckpointPath(), []byte("{bad}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := invalid.DropCheckpointRecords(map[uint64]bool{1: true}); err == nil {
+		t.Fatal("invalid checkpoint log was rewritten")
+	}
+}
+
 func TestCheckpointReadEdgeCases(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

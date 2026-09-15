@@ -582,6 +582,92 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	}, nil
 }
 
+// AnnotateDroppingStranded explicitly discards unreachable unrelated
+// checkpoints before retrying annotation.
+func AnnotateDroppingStranded(repo *gitcmd.Repo) (AnnotateResult, error) {
+	result, err := Annotate(repo)
+	if err == nil {
+		return result, nil
+	}
+	var unrelated *unrelatedCheckpointError
+	if !errors.As(err, &unrelated) {
+		return AnnotateResult{}, err
+	}
+	dropped, err := dropStrandedCheckpoints(repo)
+	if err != nil {
+		return AnnotateResult{}, err
+	}
+	result, err = Annotate(repo)
+	if err != nil {
+		return AnnotateResult{}, fmt.Errorf("annotate after dropping %d stranded checkpoints: %w", dropped, err)
+	}
+	if dropped > 0 {
+		warning := fmt.Sprintf("dropped %d stranded checkpoints with bases no branch can reach", dropped)
+		result.Warnings = append([]string{warning}, result.Warnings...)
+	}
+	return result, nil
+}
+
+func dropStrandedCheckpoints(repo *gitcmd.Repo) (int, error) {
+	dataStore := store.New(repo.GitDir)
+	held, err := lock.Acquire(dataStore.LockPath(), lockTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer held.Release()
+	records, _, err := dataStore.ReadCheckpoints()
+	if err != nil {
+		return 0, err
+	}
+	state, err := dataStore.ReadState()
+	if err != nil {
+		return 0, err
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return 0, err
+	}
+	parents, err := repo.Parents(head)
+	if err != nil {
+		return 0, err
+	}
+	parent := ""
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
+	reachable := cachedReachable(repo)
+	sequences := map[uint64]bool{}
+	for _, record := range records {
+		if record.Seq <= state.LastCheckpointSeq ||
+			record.BaseCommit == parent ||
+			record.BaseCommit == head {
+			continue
+		}
+		alive, err := reachable(record.BaseCommit)
+		if err != nil {
+			return 0, fmt.Errorf("check checkpoint %d base reachability: %w", record.Seq, err)
+		}
+		if alive {
+			return 0, &unrelatedCheckpointError{Seq: record.Seq, Base: record.BaseCommit}
+		}
+		sequences[record.Seq] = true
+	}
+	dropped, err := dataStore.DropCheckpointRecords(sequences)
+	if err != nil {
+		return 0, fmt.Errorf("drop stranded checkpoints: %w", err)
+	}
+	return dropped, nil
+}
+
+type unrelatedCheckpointError struct {
+	Seq  uint64
+	Base string
+}
+
+func (err *unrelatedCheckpointError) Error() string {
+	return fmt.Sprintf("checkpoint %d belongs to unrelated base commit %q", err.Seq, err.Base)
+}
+
 func selectRecords(records []model.Checkpoint, consumed uint64, base, head string) ([]model.Checkpoint, []model.Checkpoint, uint64, error) {
 	last := consumed
 	var active []model.Checkpoint
@@ -601,11 +687,28 @@ func selectRecords(records []model.Checkpoint, consumed uint64, base, head strin
 			carryStarted = true
 			carry = append(carry, record)
 		default:
-			return nil, nil, consumed, fmt.Errorf("checkpoint %d belongs to unrelated base commit %q", record.Seq, record.BaseCommit)
+			return nil, nil, consumed, &unrelatedCheckpointError{Seq: record.Seq, Base: record.BaseCommit}
 		}
 		last = record.Seq
 	}
 	return active, carry, last, nil
+}
+
+// cachedReachable memoizes branch containment per base commit so a large
+// stranded log costs one Git call per distinct base.
+func cachedReachable(repo *gitcmd.Repo) func(string) (bool, error) {
+	cache := map[string]bool{}
+	return func(commit string) (bool, error) {
+		if value, ok := cache[commit]; ok {
+			return value, nil
+		}
+		value, err := repo.AnyBranchContains(commit)
+		if err != nil {
+			return false, err
+		}
+		cache[commit] = value
+		return value, nil
+	}
 }
 
 func collectPaths(records []model.Checkpoint, state model.State, changes map[string]gitcmd.Change) []string {

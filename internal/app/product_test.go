@@ -30,6 +30,10 @@ func TestProductCommandFlow(t *testing.T) {
 	if code != ExitSuccess || err != nil || !strings.Contains(stdout, "annotated ") || stderr != "" {
 		t.Fatalf("annotate = %d, %q, %q, %v", code, stdout, stderr, err)
 	}
+	code, stdout, stderr, err = appRun(root, now, nil, "annotate", "--drop-stranded")
+	if code != ExitSuccess || err != nil || !strings.Contains(stdout, "already annotated ") || stderr != "" {
+		t.Fatalf("annotate drop stranded = %d, %q, %q, %v", code, stdout, stderr, err)
+	}
 	humanPayload := `{"session_id":"s","tool_name":"Edit","tool_input":{"file_path":"file.txt"}}`
 	code, stdout, stderr, err = appRun(root, now, strings.NewReader(humanPayload),
 		"checkpoint", "droid", "--type", "human", "--hook-input", "stdin")
@@ -424,6 +428,7 @@ func TestProductCommandUsageAndFailures(t *testing.T) {
 		{"checkpoint unknown flag", `{}`, []string{"checkpoint", "droid", "--bad"}, ExitUsage},
 		{"agent v1 explicit type", `{}`, []string{"checkpoint", "agent-v1", "--type", "ai", "--hook-input", "stdin"}, ExitUsage},
 		{"annotate argument", "", []string{"annotate", "extra"}, ExitUsage},
+		{"annotate unknown flag", "", []string{"annotate", "--bad"}, ExitUsage},
 		{"blame missing file", "", []string{"blame"}, ExitUsage},
 		{"blame unknown flag", "", []string{"blame", "--bad", "file"}, ExitUsage},
 		{"status argument", "", []string{"status", "extra"}, ExitUsage},
