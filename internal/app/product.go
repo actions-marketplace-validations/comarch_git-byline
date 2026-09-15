@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/comarch/git-byline/internal/dashboard"
@@ -22,47 +20,27 @@ import (
 	"github.com/comarch/git-byline/internal/model"
 	"github.com/comarch/git-byline/internal/preset"
 	"github.com/comarch/git-byline/internal/provenance"
-	"github.com/comarch/git-byline/internal/report"
+	"github.com/comarch/git-byline/internal/transcript"
 )
 
 var checkpointInputTimeoutNanos atomic.Int64
 
+// checkpointArgs holds the validated checkpoint command surface.
+type checkpointArgs struct {
+	presetName string
+	explicit   model.Author
+}
+
 func runCheckpoint(env *Env, command *command, args []string) (int, error) {
-	if len(args) == 0 {
-		return commandUsageError(env, command, errors.New("preset is required"))
-	}
-	presetName := args[0]
-	flags := flag.NewFlagSet(command.name, flag.ContinueOnError)
-	var output strings.Builder
-	flags.SetOutput(&output)
-	typeName := flags.String("type", "", "human or ai")
-	hookInput := flags.String("hook-input", "", "must be stdin")
-	managedBy := flags.String("managed-by", "", "managed hook owner")
-	if err := flags.Parse(args[1:]); err != nil {
-		return flagError(env, command, output.String(), err)
-	}
-	if flags.NArg() != 0 {
-		return commandUsageError(env, command, errors.New("checkpoint takes no positional arguments after the preset"))
-	}
-	if *hookInput != "stdin" {
-		return commandUsageError(env, command, errors.New("--hook-input must be stdin"))
-	}
-	if *managedBy != "" && *managedBy != "git-byline" {
-		return commandUsageError(env, command, errors.New("--managed-by must be git-byline"))
-	}
-	explicit := model.Author(*typeName)
-	if presetName == "agent-v1" {
-		if explicit != "" {
-			return commandUsageError(env, command, errors.New("agent-v1 does not accept --type"))
-		}
-	} else if explicit != model.AuthorHuman && explicit != model.AuthorAI {
-		return commandUsageError(env, command, errors.New("--type must be human or ai"))
+	parsed, code, done, err := parseCheckpointArgs(env, command, args)
+	if done {
+		return code, err
 	}
 	input, err := readCheckpointInput(env.Stdin)
 	if err != nil {
 		return operationalError(env, command.name, err)
 	}
-	event, handled, parseErr := preset.Parse(presetName, explicit, bytes.NewReader(input))
+	event, handled, parseErr := preset.Parse(parsed.presetName, parsed.explicit, bytes.NewReader(input))
 	if parseErr == nil && !handled {
 		return ExitSuccess, nil
 	}
@@ -76,12 +54,78 @@ func runCheckpoint(env *Env, command *command, args []string) (int, error) {
 	if parseErr != nil {
 		return operationalError(env, command.name, parseErr)
 	}
+	event = resolveEventModel(event)
 	result, err := provenance.Capture(repo, event, env.now())
 	if err != nil {
 		return operationalError(env, command.name, err)
 	}
 	writeWarnings(env, result.Warnings)
 	return ExitSuccess, nil
+}
+
+// parseCheckpointArgs validates flags and the preset surface. done marks a
+// finished exit path with its code and error.
+func parseCheckpointArgs(env *Env, command *command, args []string) (checkpointArgs, int, bool, error) {
+	if len(args) == 0 {
+		code, err := commandUsageError(env, command, errors.New("preset is required"))
+		return checkpointArgs{}, code, true, err
+	}
+	parsed := checkpointArgs{presetName: args[0]}
+	flags := flag.NewFlagSet(command.name, flag.ContinueOnError)
+	var output strings.Builder
+	flags.SetOutput(&output)
+	typeName := flags.String("type", "", "human or ai")
+	hookInput := flags.String("hook-input", "", "must be stdin")
+	managedBy := flags.String("managed-by", "", "managed hook owner")
+	if err := flags.Parse(args[1:]); err != nil {
+		code, err := flagError(env, command, output.String(), err)
+		return checkpointArgs{}, code, true, err
+	}
+	if flags.NArg() != 0 {
+		code, err := commandUsageError(env, command, errors.New("checkpoint takes no positional arguments after the preset"))
+		return checkpointArgs{}, code, true, err
+	}
+	if *hookInput != "stdin" {
+		code, err := commandUsageError(env, command, errors.New("--hook-input must be stdin"))
+		return checkpointArgs{}, code, true, err
+	}
+	if *managedBy != "" && *managedBy != "git-byline" {
+		code, err := commandUsageError(env, command, errors.New("--managed-by must be git-byline"))
+		return checkpointArgs{}, code, true, err
+	}
+	parsed.explicit = model.Author(*typeName)
+	if parsed.presetName == "agent-v1" {
+		if parsed.explicit != "" {
+			code, err := commandUsageError(env, command, errors.New("agent-v1 does not accept --type"))
+			return checkpointArgs{}, code, true, err
+		}
+		return parsed, ExitSuccess, false, nil
+	}
+	if parsed.explicit != model.AuthorHuman && parsed.explicit != model.AuthorAI {
+		code, err := commandUsageError(env, command, errors.New("--type must be human or ai"))
+		return checkpointArgs{}, code, true, err
+	}
+	return parsed, ExitSuccess, false, nil
+}
+
+// resolveEventModel replaces the fallback model with the model named by the
+// session transcript or sidecar when the event allows it.
+func resolveEventModel(event preset.Event) preset.Event {
+	if event.Type != model.AuthorAI || event.Model != preset.FallbackModel || event.TranscriptPath == "" {
+		return event
+	}
+	resolved, err := transcript.ResolveModel(event.TranscriptPath)
+	if err != nil || resolved == "" {
+		return event
+	}
+	candidate := event
+	candidate.Model = resolved
+	if model.ValidateAttribution(model.Attribution{
+		Author: candidate.Type, Agent: candidate.Agent, Model: candidate.Model, Session: candidate.Session,
+	}) != nil {
+		return event
+	}
+	return candidate
 }
 
 func readCheckpointInput(input io.Reader) ([]byte, error) {
@@ -153,21 +197,9 @@ func runDashboard(env *Env, command *command, args []string) (int, error) {
 		if flags.NArg() != 0 {
 			return commandUsageError(env, command, errors.New("--range or --repo cannot be combined with a file argument"))
 		}
-		rangeArgs := []string(nil)
-		if rangeSpecified {
-			rangeArgs = []string{rangeValue}
-		}
-		from, to, err := parseRevisionRange(rangeArgs, command.name)
+		aggregate, code, err := collectRangeAggregate(env, command, rangeSpecified, rangeValue)
 		if err != nil {
-			return commandUsageError(env, command, err)
-		}
-		repo, err := discoverForEnv(env)
-		if err != nil {
-			return operationalError(env, command.name, err)
-		}
-		aggregate, err := report.Collect(repo, from, to, 0)
-		if err != nil {
-			return operationalError(env, command.name, err)
+			return code, err
 		}
 		data, err := dashboard.RenderRange(aggregate)
 		if err != nil {
@@ -177,7 +209,7 @@ func runDashboard(env *Env, command *command, args []string) (int, error) {
 		if err != nil {
 			return operationalError(env, command.name, err)
 		}
-		if err := writeDashboard(file, path, data); err != nil {
+		if err := writeExclusiveOutput(file, path, data, "dashboard"); err != nil {
 			return operationalError(env, command.name, err)
 		}
 		fmt.Fprintln(env.Stdout, path)
@@ -216,7 +248,7 @@ func runDashboard(env *Env, command *command, args []string) (int, error) {
 	if err != nil {
 		return operationalError(env, command.name, err)
 	}
-	if err := writeDashboard(file, path, data); err != nil {
+	if err := writeExclusiveOutput(file, path, data, "dashboard"); err != nil {
 		return operationalError(env, command.name, err)
 	}
 	fmt.Fprintln(env.Stdout, path)
@@ -231,53 +263,7 @@ func createDashboardOutput(env *Env, requested string) (*os.File, string, error)
 		}
 		return file, file.Name(), nil
 	}
-	if requested == "-" {
-		return nil, "", errors.New("dashboard output must be a file")
-	}
-	if strings.ContainsRune(requested, 0) {
-		return nil, "", errors.New("dashboard output path contains NUL")
-	}
-	for _, char := range requested {
-		if unicode.IsControl(char) {
-			return nil, "", errors.New("dashboard output path contains a control character")
-		}
-	}
-	var path string
-	if filepath.IsAbs(requested) {
-		path = filepath.Clean(requested)
-	} else {
-		dir, err := env.workingDir()
-		if err != nil {
-			return nil, "", err
-		}
-		path = filepath.Join(dir, filepath.Clean(requested))
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, "", fmt.Errorf("create dashboard %s: %w", path, err)
-	}
-	return file, path, nil
-}
-
-func writeDashboard(file *os.File, path string, data []byte) error {
-	success := false
-	defer func() {
-		_ = file.Close()
-		if !success {
-			_ = os.Remove(path)
-		}
-	}()
-	if _, err := file.Write(data); err != nil {
-		return fmt.Errorf("write dashboard %s: %w", path, err)
-	}
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync dashboard %s: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close dashboard %s: %w", path, err)
-	}
-	success = true
-	return nil
+	return createExclusiveOutput(env, requested, "dashboard")
 }
 
 func runAnnotate(env *Env, command *command, args []string) (int, error) {

@@ -296,18 +296,7 @@ func writeDashboardTestNote(t *testing.T, repo *gitcmd.Repo, commit string, note
 
 func TestBlameTextRendersHumanOverrideMetadata(t *testing.T) {
 	t.Parallel()
-	root := appRepo(t)
-	appWrite(t, root, "file.txt", "human replacement\n")
-	appCommit(t, root, "override")
-	head := strings.TrimSpace(appGit(t, root, "rev-parse", "HEAD"))
-	repo, err := gitcmd.Discover(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blob, exists, err := repo.BlobID(head, "file.txt")
-	if err != nil || !exists {
-		t.Fatalf("BlobID() = %q, %t, %v", blob, exists, err)
-	}
+	root, repo, head, blob := appRepoWithCommittedFile(t, "file.txt", "human replacement\n")
 	data, err := notes.Encode(model.Note{
 		Version: model.NoteVersion,
 		Files: map[string]model.NoteFile{
@@ -349,7 +338,7 @@ func TestDashboardTempOutputRemainsReserved(t *testing.T) {
 	if !errors.Is(err, os.ErrExist) {
 		t.Fatalf("second create error = %v, want file exists", err)
 	}
-	if err := writeDashboard(file, path, []byte("report")); err != nil {
+	if err := writeExclusiveOutput(file, path, []byte("report"), "dashboard"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -392,32 +381,30 @@ func TestTemplateHookCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	code, stdout, stderr, err := appRun(
-		root,
-		time.Time{},
-		nil,
-		"install-hooks",
-		"--agent", "none",
-		"--git",
-		"--template",
-		"--local-notes",
-	)
-	if code != ExitSuccess || err != nil || stderr != "" ||
-		!strings.Contains(stdout, "updated global git config init.templateDir") {
-		t.Fatalf("template install = %d, %q, %q, %v", code, stdout, stderr, err)
+	install := []string{"install-hooks", "--agent", "none", "--git", "--template", "--local-notes"}
+	uninstall := []string{"uninstall", "--agent", "none", "--git", "--template"}
+
+	stdout := runTemplateCommand(t, root, install...)
+	if !strings.Contains(stdout, "updated global git config init.templateDir") {
+		t.Fatalf("template install status = %q, want the config update line", stdout)
 	}
-	code, stdout, stderr, err = appRun(
-		root,
-		time.Time{},
-		nil,
-		"uninstall",
-		"--agent", "none",
-		"--git",
-		"--template",
-	)
-	if code != ExitSuccess || err != nil || stderr != "" ||
-		!strings.Contains(stdout, "removed global git config init.templateDir") {
-		t.Fatalf("template uninstall = %d, %q, %q, %v", code, stdout, stderr, err)
+	if strings.Contains(stdout, "hooks already installed") {
+		t.Fatalf("template install status = %q, config change must suppress the no-op line", stdout)
+	}
+	stdout = runTemplateCommand(t, root, install...)
+	if stdout != "hooks already installed\n" {
+		t.Fatalf("template reinstall status = %q, want only the no-op line", stdout)
+	}
+	stdout = runTemplateCommand(t, root, uninstall...)
+	if !strings.Contains(stdout, "removed global git config init.templateDir") {
+		t.Fatalf("template uninstall status = %q, want the config removal line", stdout)
+	}
+	if strings.Contains(stdout, "no managed hooks found") {
+		t.Fatalf("template uninstall status = %q, config change must suppress the no-op line", stdout)
+	}
+	stdout = runTemplateCommand(t, root, uninstall...)
+	if stdout != "no managed hooks found\n" {
+		t.Fatalf("template re-uninstall status = %q, want only the no-op line", stdout)
 	}
 }
 
@@ -518,6 +505,79 @@ func TestCheckpointInputDeadline(t *testing.T) {
 	}
 }
 
+func TestCheckpointModelResolution(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		transcript string
+		sidecar    string
+		want       string
+	}{
+		{
+			name:       "transcript model",
+			transcript: `{"type":"message","message":{"role":"assistant","modelId":"droid-test-model"}}` + "\n",
+			want:       "ai:droid/droid-test-model",
+		},
+		{
+			name:       "sidecar fallback",
+			transcript: "{\"message\":{\"role\":\"user\"}}\n",
+			sidecar:    `{"model":"sidecar-model"}`,
+			want:       "ai:droid/sidecar-model",
+		},
+		{
+			name: "unresolved stays unknown",
+			want: "ai:droid/unknown",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			runModelResolutionCase(t, test.transcript, test.sidecar, test.want)
+		})
+	}
+}
+
+func runModelResolutionCase(t *testing.T, transcript, sidecar, want string) {
+	t.Helper()
+	dir := t.TempDir()
+	if transcript != "" {
+		if err := os.WriteFile(filepath.Join(dir, "session.jsonl"), []byte(transcript), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sidecar != "" {
+		if err := os.WriteFile(filepath.Join(dir, "session.settings.json"), []byte(sidecar), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	root := appRepo(t)
+	appWrite(t, root, "file.txt", "base\n")
+	appCommit(t, root, "base")
+	// Backslashes in a Windows temp path are not JSON escapes.
+	payload := `{"session_id":"s","tool_name":"Edit","transcript_path":"` + filepath.ToSlash(filepath.Join(dir, "session.jsonl")) +
+		`","tool_input":{"file_path":"file.txt"}}`
+	stdout := runCheckpointBlameFlow(t, root, now, "droid", payload, payload)
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("blame %q does not contain %q", stdout, want)
+	}
+}
+
+func TestWindsurfCheckpointFlow(t *testing.T) {
+	t.Parallel()
+	root := appRepo(t)
+	appWrite(t, root, "file.txt", "base\n")
+	appCommit(t, root, "base")
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	prePayload := `{"agent_action_name":"pre_write_code","trajectory_id":"traj-1","model_name":"Claude Sonnet 4","tool_info":{"file_path":"file.txt"}}`
+	postPayload := `{"agent_action_name":"post_write_code","trajectory_id":"traj-1","model_name":"Claude Sonnet 4","tool_info":{"file_path":"file.txt"}}`
+	stdout := runCheckpointBlameFlow(t, root, now, "portable-windsurf", prePayload, postPayload)
+	if !strings.Contains(stdout, "ai:windsurf/Claude Sonnet 4") {
+		t.Fatalf("blame %q does not contain the windsurf model", stdout)
+	}
+}
+
 func appRun(root string, now time.Time, input io.Reader, args ...string) (int, string, string, error) {
 	if input == nil {
 		input = strings.NewReader("")
@@ -574,6 +634,62 @@ func appGit(t *testing.T, root string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
+}
+
+// appRepoWithCommittedFile commits one file and returns the repository, its
+// HEAD, and the blob ID of the committed content.
+func appRepoWithCommittedFile(t *testing.T, path, content string) (string, *gitcmd.Repo, string, string) {
+	t.Helper()
+	root := appRepo(t)
+	appWrite(t, root, path, content)
+	appCommit(t, root, "content")
+	head := appHead(t, root)
+	repo, err := gitcmd.Discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, exists, err := repo.BlobID(head, path)
+	if err != nil || !exists {
+		t.Fatalf("blob = %q, %t, %v", blob, exists, err)
+	}
+	return root, repo, head, blob
+}
+
+// runTemplateCommand asserts one successful template-scope hook command and
+// returns its stdout.
+func runTemplateCommand(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	code, stdout, stderr, err := appRun(root, time.Time{}, nil, args...)
+	if code != ExitSuccess || err != nil || stderr != "" {
+		t.Fatalf("Run(%v) = %d, %q, %q, %v", args, code, stdout, stderr, err)
+	}
+	return stdout
+}
+
+// runCheckpointBlameFlow records a human and an AI checkpoint for the preset
+// with the two payloads, commits, annotates, and returns the blame text.
+func runCheckpointBlameFlow(t *testing.T, root string, now time.Time, preset, humanPayload, aiPayload string) string {
+	t.Helper()
+	code, _, stderr, err := appRun(root, now, strings.NewReader(humanPayload),
+		"checkpoint", preset, "--type", "human", "--hook-input", "stdin")
+	if code != ExitSuccess || err != nil || stderr != "" {
+		t.Fatalf("human checkpoint = %d, %q, %v", code, stderr, err)
+	}
+	appWrite(t, root, "file.txt", "base\nai\n")
+	code, _, stderr, err = appRun(root, now.Add(time.Second), strings.NewReader(aiPayload),
+		"checkpoint", preset, "--type", "ai", "--hook-input", "stdin")
+	if code != ExitSuccess || err != nil || stderr != "" {
+		t.Fatalf("ai checkpoint = %d, %q, %v", code, stderr, err)
+	}
+	appCommit(t, root, "ai")
+	if code, _, _, err = appRun(root, now, nil, "annotate"); code != ExitSuccess || err != nil {
+		t.Fatalf("annotate = %d, %v", code, err)
+	}
+	code, stdout, stderr, err := appRun(root, now, nil, "blame", "file.txt")
+	if code != ExitSuccess || err != nil || stderr != "" {
+		t.Fatalf("blame = %d, %q, %v", code, stderr, err)
+	}
+	return stdout
 }
 
 func TestAnnotatePrintsSkippedDuringRebase(t *testing.T) {
