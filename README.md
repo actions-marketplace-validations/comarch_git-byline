@@ -462,8 +462,8 @@ Nineteen commands, one binary:
 | Command | Purpose |
 | --- | --- |
 | `checkpoint <preset>` | Record a human or AI edit snapshot from hook input |
-| `annotate [--drop-stranded]` | Replay pending snapshots and annotate `HEAD`; `--drop-stranded` destructively removes unreachable unrelated checkpoint records before retrying, so preview with `recover` first |
-| `recover [--drop] [--json]` | Preview unrelated checkpoints and blocking branches; explicitly drop unreachable records and retry annotation |
+| `annotate [--drop-stranded]` | Replay pending snapshots and annotate `HEAD`; checkpoints from another branch context park with a warning and resume when branch and base return. `--drop-stranded` validates annotation, then destructively removes parked checkpoints whose base no branch can reach, so preview with `recover` first |
+| `recover [--drop] [--json]` | Preview parked checkpoint branch contexts and blocking branches; explicitly drop unreachable records and retry annotation |
 | `blame [--json] [--color=auto\|always\|never] <file>` | Show line attribution for a file at `HEAD` (file resolves from the working directory first, like `git blame`) |
 | `status [--json]` | Show checkpoint, pending, and annotation state |
 | `dashboard [--range <rev-range>] [--repo] [--output FILE] [file]` | Generate a self-contained local HTML report |
@@ -483,14 +483,19 @@ Nineteen commands, one binary:
 
 `git byline check` exits with status 1 when a policy violation is found.
 
-`git byline recover` is read-only by default. It reports each unrelated
+`git byline recover` is read-only by default. It reports each parked
 checkpoint, whether its base object still exists, and every local or
-remote-tracking branch that reaches that base. Use `recover --drop` only after
-the preview marks every unrelated record as stranded. Any blocked checkpoint
-refuses the whole cleanup; annotate its listed branch or delete that branch,
-then preview again. The command rechecks reachability, drops only unreachable
-records, and retries annotation. Hook-driven annotation never drops evidence
-automatically.
+remote-tracking branch that reaches that base. Parked checkpoints keep their
+source branch context, so sibling branches from one base stay independent.
+They resume automatically when both branch and base return, so recovery is
+usually not needed. Use
+`recover --drop` only after the preview reports `Blocked checkpoints: 0` and
+marks every listed parked checkpoint `droppable true`. Any blocked checkpoint
+refuses the whole cleanup; restore its recorded branch and base to consume the
+evidence, or delete every listed branch, then preview again. The command
+validates ordinary annotation before deletion, rechecks reachability, drops
+only unreachable records, and retries annotation. Hook-driven annotation
+never drops evidence automatically.
 
 `git byline stats` abbreviates commit identifiers in its text report and
 prints the full identifiers in `--json` output, so tooling never depends on

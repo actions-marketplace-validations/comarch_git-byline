@@ -84,7 +84,7 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 		return CaptureResult{}, err
 	}
 	warnings := append([]string(nil), logWarnings...)
-	state, err := dataStore.ReadState()
+	state, stateMigration, err := dataStore.ReadStateForUpdate()
 	if err != nil {
 		return CaptureResult{}, err
 	}
@@ -92,10 +92,15 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 	if err != nil {
 		return CaptureResult{}, err
 	}
+	branchRef, _, err := repo.CurrentBranchRef()
+	if err != nil {
+		return CaptureResult{}, err
+	}
 	seq := state.LastCheckpointSeq + 1
 	if len(records) > 0 && records[len(records)-1].Seq >= seq {
 		seq = records[len(records)-1].Seq + 1
 	}
+	laneID := currentCheckpointLaneID(records, state, branchRef, head, seq)
 	paths := append([]string(nil), event.Paths...)
 	var before model.Checkpoint
 	if kind == model.CheckpointKindShellPre {
@@ -115,8 +120,9 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 			warnings = append(warnings, "ignored shell_post without a matching shell_pre")
 			return CaptureResult{Warnings: warnings}, nil
 		}
-		if before.BaseCommit != head {
-			warnings = append(warnings, "ignored shell_post with a different base commit")
+		if before.BaseCommit != head ||
+			(before.Version >= model.CheckpointVersion && before.BranchRef != branchRef) {
+			warnings = append(warnings, "ignored shell_post with a different base or branch context")
 			return CaptureResult{Warnings: warnings}, nil
 		}
 		var err error
@@ -175,6 +181,8 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 	if kind == model.CheckpointKindShellPre && len(records) > 0 &&
 		records[len(records)-1].Kind == model.CheckpointKindShellPre &&
 		records[len(records)-1].EventID == event.EventID &&
+		records[len(records)-1].BaseCommit == head &&
+		records[len(records)-1].BranchRef == branchRef &&
 		snapshotsEqualCheckpoints(records[len(records)-1].Files, snapshots) {
 		return CaptureResult{}, nil
 	}
@@ -187,6 +195,8 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 		Kind:       kind,
 		Seq:        seq,
 		BaseCommit: head,
+		BranchRef:  branchRef,
+		LaneID:     laneID,
 		EventID:    event.EventID,
 		TS:         now.UTC().Format(time.RFC3339Nano),
 		Type:       event.Type,
@@ -200,6 +210,11 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 	if err := dataStore.CheckCheckpointAppend(record, len(records)+len(logWarnings)); err != nil {
 		return CaptureResult{}, err
 	}
+	if stateMigration {
+		if err := dataStore.WriteState(state); err != nil {
+			return CaptureResult{}, fmt.Errorf("persist state migration: %w", err)
+		}
+	}
 	retained := retainedBlobs(records, state, record)
 	if err := repo.ProtectBlobs(retained); err != nil {
 		return CaptureResult{}, fmt.Errorf("protect checkpoint blobs: %w", err)
@@ -208,6 +223,26 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 		return CaptureResult{}, err
 	}
 	return CaptureResult{Recorded: len(snapshots), Warnings: warnings}, nil
+}
+
+func currentCheckpointLaneID(
+	records []model.Checkpoint,
+	state model.State,
+	branchRef, base string,
+	nextSeq uint64,
+) string {
+	for index := len(records) - 1; index >= 0; index-- {
+		record := records[index]
+		if checkpointConsumed(record, state) {
+			continue
+		}
+		if record.Version == model.CheckpointVersion &&
+			record.BranchRef == branchRef &&
+			record.BaseCommit == base {
+			return record.LaneID
+		}
+	}
+	return model.CheckpointLaneID(nextSeq)
 }
 
 func shellDirtyPaths(repo *gitcmd.Repo) ([]string, error) {
@@ -305,10 +340,32 @@ func snapshotsEqualCheckpoints(left, right []model.Snapshot) bool {
 	return true
 }
 
+// checkpointConsumed reports whether an annotation already consumed a
+// checkpoint record. The version 1 scalar watermark stays a frozen floor:
+// version 1 could only consume an unbroken journal prefix, so every sequence
+// at or below the floor is consumed and the floor never advances again.
+// Version 3 consumption is per branch and base context: a record counts as
+// consumed when its own lane reached its sequence.
+func checkpointConsumed(record model.Checkpoint, state model.State) bool {
+	if record.Seq <= state.LastCheckpointSeq {
+		return true
+	}
+	branchLanes := state.Lanes[record.BranchRef]
+	consumed, ok := branchLanes[checkpointLaneID(record)]
+	return ok && record.Seq <= consumed
+}
+
+func checkpointLaneID(record model.Checkpoint) string {
+	if record.Version == model.CheckpointVersionV1 {
+		return model.LegacyCheckpointLaneID(record.BaseCommit)
+	}
+	return record.LaneID
+}
+
 func retainedBlobs(records []model.Checkpoint, state model.State, extra model.Checkpoint) []string {
 	var result []string
 	for _, record := range records {
-		if record.Seq <= state.LastCheckpointSeq {
+		if checkpointConsumed(record, state) {
 			continue
 		}
 		for _, file := range record.Files {
@@ -335,6 +392,7 @@ type AnnotateResult struct {
 	Noop               bool     `json:"noop,omitempty"`
 	Skipped            bool     `json:"skipped,omitempty"`
 	DroppedCheckpoints int      `json:"dropped_checkpoints,omitempty"`
+	ParkedCheckpoints  int      `json:"parked_checkpoints,omitempty"`
 	Warnings           []string `json:"warnings,omitempty"`
 }
 
@@ -360,6 +418,10 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	}
 	if head == "" {
 		return AnnotateResult{}, errors.New("cannot annotate an unborn repository")
+	}
+	branchRef, _, err := repo.CurrentBranchRef()
+	if err != nil {
+		return AnnotateResult{}, err
 	}
 	// A rebase replay creates commits without fresh checkpoint evidence.
 	// Annotating them would guess attribution and then block the post-rewrite
@@ -411,9 +473,20 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 		warnings = append(warnings, "initializing attribution on a repository with existing history")
 	}
 
-	active, carry, lastSeq, err := selectRecords(records, state.LastCheckpointSeq, parent, head)
+	selection, err := selectRecords(records, state, branchRef, parent, head)
 	if err != nil {
 		return AnnotateResult{}, err
+	}
+	active := selection.Active
+	carry := selection.Carry
+	parkedCount := 0
+	for _, count := range selection.Parked {
+		parkedCount += count
+	}
+	if parkedCount > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"parked %d checkpoints in %d unrelated branch contexts; they stay protected and resume when their branch and base return",
+			parkedCount, len(selection.Parked)))
 	}
 	changes, err := repo.Changes(head, parent)
 	if err != nil {
@@ -557,7 +630,7 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	}
 	nextState := state
 	nextState.LastAnnotatedCommit = head
-	nextState.LastCheckpointSeq = lastSeq
+	nextState.Lanes = advanceLanes(state.Lanes, selection)
 	nextState.Pending = model.PendingState{BaseCommit: head, Files: nextPending}
 	if err := dataStore.CheckStateWrite(nextState); err != nil {
 		return AnnotateResult{}, err
@@ -573,40 +646,57 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	if err := dataStore.WriteState(nextState); err != nil {
 		return AnnotateResult{}, err
 	}
-	if err := repo.ProtectBlobs(pendingBlobs(nextState)); err != nil {
+	// The retention ref keeps blobs of every unconsumed record, which
+	// includes parked lanes from other branches.
+	if err := repo.ProtectBlobs(retainedBlobs(records, nextState, model.Checkpoint{})); err != nil {
 		return AnnotateResult{}, fmt.Errorf("compact retained snapshots: %w", err)
 	}
 	return AnnotateResult{
-		Commit:   head,
-		Files:    len(note.Files),
-		Warnings: warnings,
+		Commit:            head,
+		Files:             len(note.Files),
+		ParkedCheckpoints: parkedCount,
+		Warnings:          warnings,
 	}, nil
 }
 
-// AnnotateDroppingStranded explicitly discards unreachable unrelated
-// checkpoints before retrying annotation.
+// AnnotateDroppingStranded explicitly discards unreachable parked lanes
+// before annotating. Annotation no longer blocks on foreign lanes, so the
+// flag exists for operators who want stranded evidence gone in the same
+// step instead of parking it.
 func AnnotateDroppingStranded(repo *gitcmd.Repo) (AnnotateResult, error) {
 	result, err := Annotate(repo)
-	if err == nil {
-		return result, nil
-	}
-	if _, _, ok := UnrelatedCheckpoint(err); !ok {
+	if err != nil {
 		return AnnotateResult{}, err
 	}
 	dropped, err := dropStrandedCheckpoints(repo)
 	if err != nil {
 		return AnnotateResult{}, err
 	}
-	result, err = Annotate(repo)
-	if err != nil {
-		return AnnotateResult{}, fmt.Errorf("annotate after dropping %d stranded checkpoints: %w", dropped, err)
+	if dropped == 0 {
+		return result, nil
 	}
-	if dropped > 0 {
-		warning := fmt.Sprintf("dropped %d stranded checkpoints with bases no branch can reach", dropped)
-		result.Warnings = append([]string{warning}, result.Warnings...)
+	if _, err = Annotate(repo); err != nil {
+		return AnnotateResult{}, fmt.Errorf(
+			"annotate after dropping %d stranded checkpoints: %w",
+			dropped,
+			err,
+		)
 	}
+	warning := fmt.Sprintf("dropped %d stranded checkpoints with bases no branch can reach", dropped)
+	result.Warnings = append([]string{warning}, withoutParkedWarnings(result.Warnings)...)
+	result.ParkedCheckpoints = 0
 	result.DroppedCheckpoints = dropped
 	return result, nil
+}
+
+func withoutParkedWarnings(warnings []string) []string {
+	result := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		if !strings.HasPrefix(warning, "parked ") {
+			result = append(result, warning)
+		}
+	}
+	return result
 }
 
 func dropStrandedCheckpoints(repo *gitcmd.Repo) (int, error) {
@@ -628,6 +718,10 @@ func dropStrandedCheckpoints(repo *gitcmd.Repo) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	branchRef, _, err := repo.CurrentBranchRef()
+	if err != nil {
+		return 0, err
+	}
 	parents, err := repo.Parents(head)
 	if err != nil {
 		return 0, err
@@ -639,9 +733,9 @@ func dropStrandedCheckpoints(repo *gitcmd.Repo) (int, error) {
 	reachable := cachedReachable(repo)
 	sequences := map[uint64]bool{}
 	for _, record := range records {
-		if record.Seq <= state.LastCheckpointSeq ||
-			record.BaseCommit == parent ||
-			record.BaseCommit == head {
+		if checkpointConsumed(record, state) ||
+			recordMatchesContext(record, branchRef, parent) ||
+			recordMatchesContext(record, branchRef, head) {
 			continue
 		}
 		if record.BaseCommit == "" {
@@ -656,7 +750,7 @@ func dropStrandedCheckpoints(repo *gitcmd.Repo) (int, error) {
 		}
 		if alive {
 			return 0, fmt.Errorf("a local or remote-tracking branch still reaches the base, "+
-				"so annotate or delete that branch first: %w",
+				"so consume or delete that branch first: %w",
 				&unrelatedCheckpointError{Seq: record.Seq, Base: record.BaseCommit})
 		}
 		sequences[record.Seq] = true
@@ -686,30 +780,96 @@ func UnrelatedCheckpoint(err error) (uint64, string, bool) {
 	return unrelated.Seq, unrelated.Base, true
 }
 
-func selectRecords(records []model.Checkpoint, consumed uint64, base, head string) ([]model.Checkpoint, []model.Checkpoint, uint64, error) {
-	last := consumed
-	var active []model.Checkpoint
-	var carry []model.Checkpoint
+type laneContext struct {
+	BranchRef string
+	LaneID    string
+}
+
+// laneSelection splits unconsumed records into active and carry contexts,
+// plus parked contexts belonging to other branches or bases.
+type laneSelection struct {
+	Active    []model.Checkpoint
+	Carry     []model.Checkpoint
+	Parked    map[laneContext]int
+	Consumed  map[laneContext]uint64
+	ActiveSeq uint64
+	CarrySeq  uint64
+}
+
+func selectRecords(records []model.Checkpoint, state model.State, branchRef, parent, head string) (laneSelection, error) {
+	selection := laneSelection{
+		Parked:   map[laneContext]int{},
+		Consumed: map[laneContext]uint64{},
+	}
 	carryStarted := false
 	for _, record := range records {
-		if record.Seq <= consumed {
+		if checkpointConsumed(record, state) {
 			continue
 		}
-		switch record.BaseCommit {
-		case base:
+		switch {
+		case recordMatchesContext(record, branchRef, parent):
 			if carryStarted {
-				return nil, nil, consumed, fmt.Errorf("checkpoint %d for parent appears after a HEAD checkpoint", record.Seq)
+				return laneSelection{}, fmt.Errorf("checkpoint %d for parent appears after a HEAD checkpoint", record.Seq)
 			}
-			active = append(active, record)
-		case head:
+			selection.Active = append(selection.Active, record)
+			selection.ActiveSeq = record.Seq
+			recordConsumedContext(selection.Consumed, record)
+		case recordMatchesContext(record, branchRef, head):
 			carryStarted = true
-			carry = append(carry, record)
+			selection.Carry = append(selection.Carry, record)
+			selection.CarrySeq = record.Seq
+			recordConsumedContext(selection.Consumed, record)
 		default:
-			return nil, nil, consumed, &unrelatedCheckpointError{Seq: record.Seq, Base: record.BaseCommit}
+			context := laneContext{BranchRef: record.BranchRef, LaneID: checkpointLaneID(record)}
+			selection.Parked[context]++
 		}
-		last = record.Seq
 	}
-	return active, carry, last, nil
+	return selection, nil
+}
+
+func recordConsumedContext(consumed map[laneContext]uint64, record model.Checkpoint) {
+	context := laneContext{BranchRef: record.BranchRef, LaneID: checkpointLaneID(record)}
+	if consumed[context] < record.Seq {
+		consumed[context] = record.Seq
+	}
+}
+
+func recordMatchesContext(record model.Checkpoint, branchRef, base string) bool {
+	return record.BaseCommit == base &&
+		(recordUsesLegacyContext(record) || record.BranchRef == branchRef)
+}
+
+func recordUsesLegacyContext(record model.Checkpoint) bool {
+	return record.Version == model.CheckpointVersionV1 ||
+		model.IsLegacyCheckpointLaneID(record.LaneID)
+}
+
+// advanceLanes records per-context consumption without mutating prior state.
+func advanceLanes(
+	lanes map[string]map[string]uint64,
+	selection laneSelection,
+) map[string]map[string]uint64 {
+	next := cloneLanes(lanes)
+	for context, consumed := range selection.Consumed {
+		if next[context.BranchRef] == nil {
+			next[context.BranchRef] = map[string]uint64{}
+		}
+		if next[context.BranchRef][context.LaneID] < consumed {
+			next[context.BranchRef][context.LaneID] = consumed
+		}
+	}
+	return next
+}
+
+func cloneLanes(lanes map[string]map[string]uint64) map[string]map[string]uint64 {
+	next := make(map[string]map[string]uint64, len(lanes)+1)
+	for branch, bases := range lanes {
+		next[branch] = make(map[string]uint64, len(bases))
+		for base, consumed := range bases {
+			next[branch][base] = consumed
+		}
+	}
+	return next
 }
 
 // cachedReachable memoizes branch containment per base commit so a large
@@ -1276,13 +1436,17 @@ func Status(repo *gitcmd.Repo) (StatusResult, error) {
 	if err != nil {
 		return StatusResult{}, err
 	}
+	branchRef, _, err := repo.CurrentBranchRef()
+	if err != nil {
+		return StatusResult{}, err
+	}
 	retained, err := repo.ProtectedBlobCount()
 	if err != nil {
 		return StatusResult{}, err
 	}
 	pending := 0
 	for _, record := range records {
-		if record.Seq > state.LastCheckpointSeq {
+		if !checkpointConsumed(record, state) {
 			pending++
 		}
 	}
@@ -1298,12 +1462,10 @@ func Status(repo *gitcmd.Repo) (StatusResult, error) {
 			}
 		}
 	}
-	preview, previewErr := previewRecovery(repo, records, state, head, nil)
+	preview, previewErr := previewRecovery(repo, records, state, branchRef, head, nil)
 	recommendedAction := preview.RecommendedAction
 	if previewErr != nil {
 		warnings = append(warnings, "cannot inspect stranded checkpoints: "+previewErr.Error())
-		recommendedAction = "git-byline recover"
-	} else if preview.BlockedCheckpoints > 0 {
 		recommendedAction = "git-byline recover"
 	} else if recommendedAction == "" && annotationPending {
 		recommendedAction = "git-byline annotate"

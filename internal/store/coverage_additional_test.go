@@ -129,6 +129,191 @@ func TestDropCheckpointRecordsReadFailure(t *testing.T) {
 	}
 }
 
+func TestRewriteCheckpointBasesAdditional(t *testing.T) {
+	t.Parallel()
+	absent := New(t.TempDir())
+	if err := absent.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err != nil {
+		t.Fatalf("absent rewrite = %v", err)
+	}
+	if err := absent.RewriteCheckpointBases("bad", nil); err != nil {
+		t.Fatalf("empty rewrite = %v", err)
+	}
+	if err := absent.RewriteCheckpointBases("bad", map[string]string{"aaaa": "bbbb"}); err == nil {
+		t.Fatal("rewrite accepted invalid branch")
+	}
+
+	invalid := New(t.TempDir())
+	writeStoreFile(t, invalid.CheckpointPath(), []byte(invalidJSONLine))
+	if err := invalid.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err == nil {
+		t.Fatal("rewrite accepted invalid checkpoint log")
+	}
+
+	unchanged := New(t.TempDir())
+	record := validCheckpoint(1)
+	record.BaseCommit = "aaaa"
+	record.BranchRef = "refs/heads/main"
+	if err := unchanged.AppendCheckpoint(record); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(unchanged.CheckpointPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unchanged.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"bbbb": "cccc"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(unchanged.CheckpointPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("no-op rewrite changed checkpoint log")
+	}
+
+	unknown := New(t.TempDir())
+	unknownData := []byte(`{"version":9,"future":true}` + "\n")
+	writeStoreFile(t, unknown.CheckpointPath(), unknownData)
+	if err := unknown.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(unknown.CheckpointPath()); err != nil ||
+		!bytes.Equal(got, unknownData) {
+		t.Fatalf("unknown rewrite = %q, %v", got, err)
+	}
+
+	noNewline := New(t.TempDir())
+	noNewlineRecord := validCheckpoint(1)
+	noNewlineRecord.BaseCommit = "aaaa"
+	noNewlineRecord.BranchRef = "refs/heads/main"
+	data := bytes.TrimSuffix(checkpointJSON(t, noNewlineRecord), []byte{'\n'})
+	writeStoreFile(t, noNewline.CheckpointPath(), data)
+	if err := noNewline.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	records, _, err := noNewline.ReadCheckpoints()
+	if err != nil || len(records) != 1 || records[0].BaseCommit != "bbbb" {
+		t.Fatalf("no-newline rewrite = %+v, %v", records, err)
+	}
+}
+
+func TestRewriteCheckpointBasesRejectsInvalidLogs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "invalid supported record",
+			data: checkpointJSON(t, validCheckpoint(0)),
+		},
+		{
+			name: "non-increasing sequences",
+			data: bytes.Join([][]byte{
+				checkpointJSON(t, validCheckpoint(1)),
+				checkpointJSON(t, validCheckpoint(1)),
+			}, nil),
+		},
+		{
+			name: "too many records",
+			data: bytes.Repeat(
+				[]byte(`{"version":9}`+"\n"),
+				maxCheckpointRecords+1,
+			),
+		},
+		{
+			name: "oversized record",
+			data: bytes.Repeat([]byte("x"), maxRecordBytes+1),
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			value := New(t.TempDir())
+			writeStoreFile(t, value.CheckpointPath(), test.data)
+			if err := value.RewriteCheckpointBases(
+				"refs/heads/main",
+				map[string]string{"aaaa": "bbbb"},
+			); err == nil {
+				t.Fatal("rewrite accepted an invalid checkpoint log")
+			}
+		})
+	}
+}
+
+func TestRewriteCheckpointBasesRejectsInvalidTargetWithoutMutation(t *testing.T) {
+	t.Parallel()
+	value := New(t.TempDir())
+	record := validCheckpoint(1)
+	record.BaseCommit = "aaaa"
+	record.BranchRef = "refs/heads/main"
+	if err := value.AppendCheckpoint(record); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(value.CheckpointPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := value.RewriteCheckpointBases(
+		record.BranchRef,
+		map[string]string{record.BaseCommit: "main", "bbbb": "branch"},
+	); err == nil ||
+		!strings.Contains(err.Error(), `rewrite target for base "aaaa"`) {
+		t.Fatalf("invalid rewrite target error = %v", err)
+	}
+	after, err := os.ReadFile(value.CheckpointPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("invalid rewrite target changed checkpoint log")
+	}
+}
+
+func TestRewriteCheckpointBasesPreservesTruncatedTail(t *testing.T) {
+	t.Parallel()
+	value := New(t.TempDir())
+	data := []byte(`{"version":2`)
+	writeStoreFile(t, value.CheckpointPath(), data)
+	if err := value.RewriteCheckpointBases(
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(value.CheckpointPath()); err != nil ||
+		!bytes.Equal(got, data) {
+		t.Fatalf("truncated rewrite = %q, %v", got, err)
+	}
+}
+
+func TestRewriteCheckpointBaseLineRejectsInvalidCurrentRecord(t *testing.T) {
+	t.Parallel()
+	if _, err := rewriteCheckpointBaseLine(
+		[]byte(`{"version":2,"unknown":true}`),
+		false,
+		"refs/heads/main",
+		map[string]string{"aaaa": "bbbb"},
+	); err == nil {
+		t.Fatal("rewriteCheckpointBaseLine accepted an invalid current record")
+	}
+}
+
 func TestCheckpointValidationAdditional(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -172,6 +357,55 @@ func TestCheckpointValidationAdditional(t *testing.T) {
 			record: func() model.Checkpoint {
 				value := validCheckpoint(1)
 				value.Files[0].Exists = false
+				return value
+			}(),
+		},
+		{
+			name: "unsupported checkpoint version",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.Version = 99
+				return value
+			}(),
+		},
+		{
+			name: "version one lane ID",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.Version = model.CheckpointVersionV1
+				return value
+			}(),
+		},
+		{
+			name: "current version missing lane ID",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.LaneID = ""
+				return value
+			}(),
+		},
+		{
+			name: "legacy lane with branch",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.LaneID = model.LegacyCheckpointLaneID("abcd1234")
+				value.BranchRef = "refs/heads/main"
+				return value
+			}(),
+		},
+		{
+			name: "invalid base commit",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.BaseCommit = "main"
+				return value
+			}(),
+		},
+		{
+			name: "invalid branch ref",
+			record: func() model.Checkpoint {
+				value := validCheckpoint(1)
+				value.BranchRef = "main"
 				return value
 			}(),
 		},
@@ -351,6 +585,12 @@ func TestAppendCheckpointFailureBranches(t *testing.T) {
 		if _, err := value.DropCheckpointRecords(map[uint64]bool{1: true}); err == nil {
 			t.Fatal("DropCheckpointRecords wrote through a read-only directory")
 		}
+		if err := value.RewriteCheckpointBases(
+			"",
+			map[string]string{"": "aaaa"},
+		); err == nil {
+			t.Fatal("RewriteCheckpointBases wrote through a read-only directory")
+		}
 	})
 }
 
@@ -371,6 +611,9 @@ func coverageStateReadCases(t *testing.T) {
 		{name: "malformed JSON", data: invalidJSONLine},
 		{name: "unsupported notes version", data: unsupportedStateJSON},
 		{name: "invalid pending base", data: invalidPendingBase},
+		{name: "invalid version one lanes", data: `{"version":1,"notes_version":3,"pending":{},"lanes":[]}`},
+		{name: "invalid version two lanes", data: `{"version":2,"notes_version":3,"pending":{},"lanes":{"abcd":[]}}`},
+		{name: "invalid version three lanes", data: `{"version":3,"notes_version":3,"pending":{},"lanes":{"refs/heads/main":7}}`},
 		{name: "legacy notes version one", data: stateJSONWithNotesVersion(model.NoteVersionV1), legacy: true},
 		{name: "legacy notes version two", data: stateJSONWithNotesVersion(model.NoteVersionV2), legacy: true},
 	}

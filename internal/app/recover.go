@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/comarch/git-byline/internal/gitcmd"
 	"github.com/comarch/git-byline/internal/model"
 	"github.com/comarch/git-byline/internal/provenance"
 )
@@ -44,15 +45,35 @@ func runRecover(env *Env, command *command, args []string) (int, error) {
 		Preview: preview,
 	}
 	if !*drop {
-		if *jsonOutput {
-			if err := writeJSON(env, commandResult); err != nil {
-				return operationalError(env, command.name, err)
-			}
-		} else {
-			writeRecoveryPreview(env.Stdout, preview)
-		}
-		return ExitSuccess, nil
+		return writeRecoverPreviewResult(env, command, commandResult, *jsonOutput)
 	}
+	return runRecoverDrop(env, command, repo, commandResult, *jsonOutput)
+}
+
+func writeRecoverPreviewResult(
+	env *Env,
+	command *command,
+	result recoverCommandResult,
+	jsonOutput bool,
+) (int, error) {
+	if jsonOutput {
+		if err := writeJSON(env, result); err != nil {
+			return operationalError(env, command.name, err)
+		}
+	} else {
+		writeRecoveryPreview(env.Stdout, result.Preview)
+	}
+	return ExitSuccess, nil
+}
+
+func runRecoverDrop(
+	env *Env,
+	command *command,
+	repo *gitcmd.Repo,
+	result recoverCommandResult,
+	jsonOutput bool,
+) (int, error) {
+	preview := result.Preview
 	if preview.BlockedCheckpoints > 0 {
 		return operationalError(env, command.name, blockedRecoveryError(preview))
 	}
@@ -60,9 +81,9 @@ func runRecover(env *Env, command *command, args []string) (int, error) {
 	if err != nil {
 		return annotateOperationalError(env, command.name, repo, err)
 	}
-	commandResult.Annotation = &annotation
-	if *jsonOutput {
-		if err := writeJSON(env, commandResult); err != nil {
+	result.Annotation = &annotation
+	if jsonOutput {
+		if err := writeJSON(env, result); err != nil {
 			return operationalError(env, command.name, err)
 		}
 		return ExitSuccess, nil
@@ -82,8 +103,12 @@ func writeRecoveryPreview(out io.Writer, report provenance.RecoveryReport) {
 		if base == "" {
 			base = "(before first commit)"
 		}
-		fmt.Fprintf(out, "Checkpoint %d: base %s, object present %t, droppable %t\n",
-			checkpoint.Seq, base, checkpoint.ObjectPresent, checkpoint.Droppable)
+		branch := checkpoint.BranchRef
+		if branch == "" {
+			branch = "(legacy or detached)"
+		}
+		fmt.Fprintf(out, "Checkpoint %d: branch %s, base %s, object present %t, droppable %t\n",
+			checkpoint.Seq, branch, base, checkpoint.ObjectPresent, checkpoint.Droppable)
 		for _, branch := range checkpoint.Branches {
 			fmt.Fprintf(out, "  Branch: %s\n", branch)
 		}
@@ -100,16 +125,22 @@ func blockedRecoveryError(report provenance.RecoveryReport) error {
 		if checkpoint.Droppable {
 			continue
 		}
+		branch := checkpoint.BranchRef
+		if branch == "" {
+			branch = "(legacy or detached)"
+		}
 		details = append(details, fmt.Sprintf(
-			"checkpoint %d base %s is reachable from %s",
+			"checkpoint %d branch %s base %s is reachable from %s",
 			checkpoint.Seq,
+			branch,
 			checkpoint.BaseCommit,
 			strings.Join(checkpoint.Branches, ", "),
 		))
 	}
 	return fmt.Errorf(
 		"refusing to drop %d blocked checkpoints\n%s\n"+
-			"annotate or delete the listed branches, then run: git-byline recover",
+			"restore each checkpoint's recorded branch and base to consume it, "+
+			"or delete every listed branch and run: git-byline recover",
 		report.BlockedCheckpoints,
 		strings.Join(details, "\n"),
 	)
