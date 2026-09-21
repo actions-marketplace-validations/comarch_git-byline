@@ -52,6 +52,18 @@ Forge merge workflows are separate from the binary trust boundary. `git byline
 ci run` reads only commits and notes already fetched into the local repository,
 then writes attribution notes locally. It never calls a forge service and never
 pushes. The generated workflow performs the Git fetch and notes push.
+`install-hooks --git` provisions the workflow file locally from the embedded
+template when the origin remote host is github.com or gitlab.com; it refuses to
+replace an existing file and never contacts the forge. `uninstall` removes the
+file only while it still matches the embedded template byte for byte.
+
+The marketplace action under `action/` is an alternative delivery of the same
+reconstruction. It runs in the calling workflow's context: the caller grants
+`contents: write`, the action downloads a release binary from the pinned
+git-byline repository, verifies it against the release `checksums.txt`, and
+pushes only `refs/notes/byline`. Unlike the generated workflow, which builds
+git-byline from the merge commit, the action runs the released binary pinned
+by its input version.
 
 The GitHub workflow requests only `contents: write`. It needs read access to
 the repository and write access to `refs/notes/byline`; it does not need issue,
@@ -71,9 +83,11 @@ binary. The generated GitLab job is stored under
 `.gitlab-ci.yml`.
 
 Both workflows reconstruct from the actual post-merge target commit. The
-GitHub workflow derives `GIT_BYLINE_CI_BASE` from the merge commit's first
-parent and uses its second parent as the source tip when present, falling back
-to the merged pull request head for a single-parent squash result. The GitLab
+GitHub workflow uses the merge commit's second parent as the source tip for a
+true merge, with its first parent as `GIT_BYLINE_CI_BASE`. A single-parent
+result, whether a squash or a rebase merge, uses the merged pull request head
+as the source and derives the base from the merge base of that head and the
+target, so a multi-commit rebase range stays complete. The GitLab
 workflow derives its base from the pushed commit's first parent and its source
 from the second parent; a single-parent result has an empty source range and is
 skipped safely. The workflow runs repository code from that merge commit before

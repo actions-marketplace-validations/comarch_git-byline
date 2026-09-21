@@ -11,6 +11,11 @@
 - The short installer one-liners execute only scripts from this repository's
   protected `main`; checksum-first and reviewed-script alternatives are
   documented.
+- The `action/` marketplace action installs the git-byline binary from the
+  pinned release repository, verifies it against the release `checksums.txt`,
+  and pins every action it uses by commit SHA. Release tags are never moved;
+  the moving action major tag `v1` follows each release publish and is
+  documented as the convenience pin, with release tags as the immutable one.
 
 ## CI
 
@@ -59,6 +64,11 @@ Merging the Release Please pull request authorizes tag and GitHub release
 creation. The `release` environment protects the separate artifact upload.
 Keep a recovery owner independent from the release credential. No personal
 token should be the only recovery path.
+
+Repository rulesets must protect every `refs/tags/v*.*.*` against updates
+and deletion, so a semantic release tag cannot be retargeted after
+publish. The moving action major tag, like `v1`, sits outside that
+pattern by design: the release workflow moves it on every publish.
 
 ## Compromise response
 

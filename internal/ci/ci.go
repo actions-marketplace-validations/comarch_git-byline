@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -92,6 +94,162 @@ func TemplatePath(provider Provider) (string, error) {
 // Template returns a copy of the canonical workflow template.
 func Template(provider Provider) ([]byte, error) {
 	return embeddedTemplate(provider)
+}
+
+// DetectProvider classifies a repository's origin remote as a supported
+// public forge. Only github.com and gitlab.com hosts are detected, so a
+// self-hosted or enterprise forge stays untouched until the user runs
+// ci install explicitly. A missing repository, a missing origin remote,
+// or a configuration read failure reports no provider: detection is
+// advisory and never fails the caller.
+func DetectProvider(dir string) (Provider, bool) {
+	repo, err := gitcmd.Discover(dir)
+	if err != nil {
+		return "", false
+	}
+	remote, ok, err := repo.ConfigPath("remote.origin.url")
+	if err != nil || !ok {
+		return "", false
+	}
+	host, ok := remoteHost(remote)
+	if !ok {
+		return "", false
+	}
+	switch host {
+	case "github.com":
+		return ProviderGitHub, true
+	case "gitlab.com":
+		return ProviderGitLab, true
+	default:
+		return "", false
+	}
+}
+
+// remoteHost extracts the host from an HTTPS, SSH, or SCP-style Git remote
+// URL. Any other scheme, such as file:// or http://, is rejected so an
+// unsupported remote is never treated as a forge. The second result is
+// false for a URL without a usable host.
+func remoteHost(remote string) (string, bool) {
+	value := remote
+	if index := strings.Index(value, "://"); index >= 0 {
+		switch strings.ToLower(value[:index]) {
+		case "https", "ssh":
+		default:
+			return "", false
+		}
+		value = value[index+3:]
+	}
+	if at := strings.LastIndex(value, "@"); at >= 0 && !strings.ContainsAny(value[:at], `/\`) {
+		value = value[at+1:]
+	}
+	end := strings.IndexAny(value, `:/`)
+	if end < 0 {
+		end = len(value)
+	}
+	if end == 0 {
+		return "", false
+	}
+	return strings.ToLower(value[:end]), true
+}
+
+// managedWorkflow pairs one provider's workflow path with its provider.
+type managedWorkflow struct {
+	provider Provider
+	relative string
+}
+
+// managedWorkflows returns the workflow path of every supported
+// provider, in a fixed order.
+func managedWorkflows() []managedWorkflow {
+	return []managedWorkflow{
+		{provider: ProviderGitHub, relative: ".github/workflows/git-byline.yml"},
+		{provider: ProviderGitLab, relative: ".gitlab/ci/git-byline.yml"},
+	}
+}
+
+// Uninstall removes forge workflow files that still match the canonical
+// template byte for byte. A modified or foreign file stays in place, so
+// removal is limited to managed content. Validation, reading, and removal
+// all happen below one os.Root, so no symlink swap between checks can
+// redirect an operation outside the root. Removals already done are
+// reported together with any later failure, so the caller can show what
+// changed before the failure.
+func Uninstall(root string) ([]string, error) {
+	rootFile, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("open CI uninstall root: %w", err)
+	}
+	defer rootFile.Close()
+	var removed []string
+	for _, workflow := range managedWorkflows() {
+		template, err := Template(workflow.provider)
+		if err != nil {
+			return removed, err
+		}
+		if err := validateManagedWorkflow(rootFile, workflow.relative); err != nil {
+			return removed, err
+		}
+		data, err := readManagedWorkflow(rootFile, workflow.relative, len(template)+1)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return removed, fmt.Errorf("read CI workflow %q: %w", workflow.relative, err)
+		}
+		if !bytes.Equal(data, template) {
+			continue
+		}
+		if err := rootFile.Remove(workflow.relative); err != nil {
+			return removed, fmt.Errorf("remove CI workflow %q: %w", workflow.relative, err)
+		}
+		removed = append(removed, workflow.relative)
+	}
+	return removed, nil
+}
+
+// validateManagedWorkflow checks every path component below root without
+// following symlinks. A missing workflow is not an error; a component
+// that exists but is not the expected kind is, so a symlink or junction
+// is refused before anything is read or removed.
+func validateManagedWorkflow(rootFile *os.Root, relative string) error {
+	components := splitPath(relative)
+	current := ""
+	for index, component := range components {
+		current = path.Join(current, component)
+		info, err := rootFile.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect CI workflow path %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked CI workflow path %q", current)
+		}
+		if index+1 < len(components) {
+			if !info.IsDir() {
+				return fmt.Errorf("CI workflow parent %q is not a directory", current)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("CI workflow path %q is not a regular file", relative)
+		}
+	}
+	return nil
+}
+
+// readManagedWorkflow reads at most maxBytes of the workflow below root,
+// so a repository-controlled file cannot exhaust memory: a file longer
+// than the template cannot match it anyway. Go 1.24 has no
+// os.Root.ReadFile, so the file opens explicitly.
+func readManagedWorkflow(rootFile *os.Root, relative string, maxBytes int) ([]byte, error) {
+	file, err := rootFile.Open(relative)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(io.LimitReader(file, int64(maxBytes)))
 }
 
 // Install writes a provider workflow without replacing an existing file.
