@@ -616,16 +616,33 @@ documented limitation, not a silent guess.
 Squash and rebase merges on GitHub or GitLab create commits that never passed
 a local hook. `git byline ci install` writes a least-privilege workflow;
 `install-hooks --git` creates the same workflow automatically when the
-origin remote is github.com or gitlab.com. `git byline ci run` reconstructs
-attribution from the pull request commits, pairing by patch ID for rebase
-merges and folding in commit order for squashes. The binary writes notes
-locally; the workflow pushes the notes ref through Git, exactly like the
-pre-push hook. `uninstall` removes the workflow only while it still matches
-the generated template byte for byte.
+origin remote is github.com or gitlab.com. The workflow installs the
+git-byline release pinned on its `GIT_BYLINE_VERSION` line, the release that
+wrote it, and checks the archive against that release's `checksums.txt`.
+Then `git byline ci run` reconstructs attribution from the pull request
+commits, pairing by patch ID for rebase merges and folding in commit order
+for squashes. The binary writes notes locally; the workflow pushes the notes
+ref through Git, exactly like the pre-push hook. `uninstall` removes the
+workflow only while it still matches the generated template; only the
+pinned release tag may differ.
 
-Prefer a marketplace action over running repository code? The same
-reconstruction ships as a composite action that installs a
-checksum-verified release binary:
+On GitLab, CI/CD variables change the download without editing the file:
+`GIT_BYLINE_VERSION` pins another release and `GIT_BYLINE_RELEASES_URL`
+points at an internal mirror of the GitHub release assets.
+
+On GitLab, a squash merge keeps the merge request commits, and their notes,
+only on the merge request head. The job finds that head through the
+`group/project!123` reference in the merged commit message and uses it only
+when its diff matches the merged commit exactly. The default merge commit
+template carries that reference. With the fast-forward merge method, add
+`%{reference}` to the squash commit template under Settings > Merge
+requests, because the default one holds only the title. Without the
+reference, or when the diffs differ, the squashed lines stay `untracked`.
+Rebase merge requests locally, where the managed hooks carry attribution to
+the new commits; GitLab's server-side rebase creates commits no hook sees.
+
+On GitHub the same reconstruction also ships as a composite action, so a
+workflow can call it instead of carrying the generated steps:
 
 ```yaml
 - uses: comarch/git-byline@v1
