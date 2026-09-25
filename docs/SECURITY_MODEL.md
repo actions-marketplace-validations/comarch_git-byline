@@ -36,6 +36,22 @@ to it, to recover the model identifier. Both reads are bounded, accept only
 absolute regular-file paths, and skip symlinks. Only the extracted model name
 is kept; transcript or settings content is never copied into any record.
 
+`checkpoint` accepts an edit path only inside a worktree of the repository
+where the hook runs. Agent hooks often run in the main checkout while the
+agent edits a linked worktree, so a path in another worktree of the same
+repository is recorded in that worktree's own checkpoint log and retention
+ref. The candidate worktrees come from `git worktree list` in the hook's
+repository, never from the payload. Each candidate is reopened and accepted
+only when Git reports the same root and the same common Git directory, so a
+removed, replaced, or foreign directory at a registered path receives
+nothing. The owning worktree applies the usual checks for `.git`, ignore
+rules, symlink escapes, regular files, size, and text. The resolved path only
+picks the owner. The path itself moves in the form the owner's own hook would
+send, so its symlink components are still checked, and a relative path that
+reaches another worktree only through a symlink stays in the hook's worktree
+and is rejected there. Paths outside every worktree of the repository stay
+rejected. Shell events keep using the dirty paths of the hook's own worktree.
+
 The managed `reference-transaction` hook has the opposite failure contract.
 It exits immediately when `GIT_BYLINE_NESTED` is set, ignores refs outside
 `HEAD`, `refs/heads/*`, and `refs/stash`, and always exits zero. This hook runs
@@ -54,8 +70,11 @@ then writes attribution notes locally. It never calls a forge service and never
 pushes. The generated workflow performs the Git fetch and notes push.
 `install-hooks --git` provisions the workflow file locally from the embedded
 template when the origin remote host is github.com or gitlab.com; it refuses to
-replace an existing file and never contacts the forge. `uninstall` removes the
-file only while it still matches the embedded template byte for byte.
+replace a different existing file and never contacts the forge. A workflow
+that differs from the embedded template only in the release tag on its
+version pin line still counts as managed, so a git-byline upgrade does not
+orphan it. `uninstall` removes the file only while it still matches the
+embedded template apart from that tag.
 
 The marketplace action is an alternative delivery of the same reconstruction.
 Its metadata lives at the repository root, where the GitHub Marketplace
@@ -64,9 +83,9 @@ subdirectory reference working; the validate gate fails when the two drift.
 It runs in the calling workflow's context: the caller grants
 `contents: write`, the action downloads a release binary from the pinned
 git-byline repository, verifies it against the release `checksums.txt`, and
-pushes only `refs/notes/byline`. Unlike the generated workflow, which builds
-git-byline from the merge commit, the action runs the released binary pinned
-by its input version.
+pushes only `refs/notes/byline`. The generated workflows install a release
+the same way, pinned by their version line; the action installs the release
+named by its version input.
 
 The GitHub workflow requests only `contents: write`. It needs read access to
 the repository and write access to `refs/notes/byline`; it does not need issue,
@@ -76,14 +95,25 @@ uses immutable action commit pins and pushes only the notes ref with
 
 The GitLab workflow is a trusted post-merge push pipeline on the project
 default branch. Merge-request and external fork pipelines are explicitly
-blocked. It expects a project token in `GITLAB_TOKEN` with only the
+blocked. It expects a project access token in `GITLAB_TOKEN` with only the
 `write_repository` scope because the job uses Git-over-HTTP `ls-remote`,
-fetch, and push operations only. The token is copied into Git's in-memory
-HTTP header for each command, removed from the shell environment before the
-binary runs, and is not written to the repository. It is not used by the
-binary. The generated GitLab job is stored under
-`.gitlab/ci/git-byline.yml` and must be included from the project's
-`.gitlab-ci.yml`.
+fetch, and push operations only. The token is the password of HTTP basic
+authentication with the user name `oauth2`, which Git over HTTPS accepts;
+the `PRIVATE-TOKEN` header works only for REST calls. The encoded credential
+is passed through Git's in-memory `http.extraHeader` for each command, the
+token is removed from the shell environment before the binary runs, and
+neither is written to the repository. It is not used by the binary. The job
+stops before it builds the header when `GIT_BYLINE_REMOTE_URL`, which is
+`CI_PROJECT_URL` by default, is not an `https://` URL, so the header never
+travels without TLS. GitLab masks the raw token in job logs, not the encoded
+header, so do not enable `CI_DEBUG_TRACE` for this job. The generated
+GitLab job is stored under `.gitlab/ci/git-byline.yml` and must be included
+from the project's `.gitlab-ci.yml`. It installs the release named by
+`GIT_BYLINE_VERSION` from `GIT_BYLINE_RELEASES_URL`, the pinned git-byline
+repository by default, over HTTPS only. It verifies the archive against that
+release's `checksums.txt` and the binary's reported version, and deletes the
+download after the run, also when a check or the run fails. A mirror URL
+moves trust for both files to the mirror.
 
 Both workflows reconstruct from the actual post-merge target commit. The
 GitHub workflow uses the merge commit's second parent as the source tip for a
@@ -92,9 +122,16 @@ result, whether a squash or a rebase merge, uses the merged pull request head
 as the source and derives the base from the merge base of that head and the
 target, so a multi-commit rebase range stays complete. The GitLab
 workflow derives its base from the pushed commit's first parent and its source
-from the second parent; a single-parent result has an empty source range and is
-skipped safely. The workflow runs repository code from that merge commit before
-pushing notes. Before every token-bearing Git operation, it re-pins the
+from the second parent. A squash merge leaves the merge request commits, and
+their notes, only on the merge request head. When the target commit message
+names the merge request as `<project path>!<iid>`, the workflow fetches
+`refs/merge-requests/<iid>/head` and uses it as the source only when its diff
+from the merge base has the same stable patch ID as the diff the target commit
+brings, so a wrong or edited reference cannot move notes onto other changes.
+Otherwise a single-parent result has an empty source range and is skipped
+safely. The workflow runs the pinned release binary, not code from
+that merge commit, before pushing notes. Before every token-bearing Git
+operation, it re-pins the
 canonical remote URL, disables repository hooks with an empty
 `core.hooksPath`, and disables system and global Git configuration. No branch,
 tag, source file, or workflow ref is pushed by the generated job.
@@ -110,7 +147,8 @@ warning and writes no notes.
 
 | Threat | Prevention | Detection | Recovery |
 | --- | --- | --- | --- |
-| Path escapes worktree | Normalize path, reject `.git`, traversal, symlink escape | Path tests and warnings | Skip snapshot, preserve prior state |
+| Path escapes worktree | Normalize path, reject `.git`, traversal, symlink escape; accept only paths inside a worktree of the hook's repository | Path tests and warnings | Skip snapshot, preserve prior state |
+| Stale or replaced linked worktree | Candidates come only from `git worktree list`; each must report the same root and common Git directory | Skip warning names the path and worktree | Skip snapshot, preserve prior state |
 | Secret file enters Git ODB | Skip Git-ignored and non-regular files | Repository scans and review | Remove local object after retention ends |
 | Malicious hook payload | Bounded input, strict event and metadata validation, path validation | Parser tests and explicit errors | No checkpoint written |
 | Malicious transcript path | Absolute regular-file check, final-symlink and reparse rejection, single-handle or identity-bound opens, bounded reads, model revalidated before use | Transcript resolver tests | Model stays `unknown` |
@@ -128,6 +166,7 @@ warning and writes no notes.
 | Dashboard exposes source or metadata | Private temporary file mode, no external resources, no automatic publication | User review and repository scans | Delete local report |
 | Hook config overwrite | Structural merge, backup, managed markers | Idempotency and preservation tests | Restore `.git-byline.bak` |
 | Fork reaches write token | Post-merge default-branch rules, explicit fork rejection, token only in fetch and push steps | Pipeline rule checks | Disable workflow and rotate token |
+| Commit message names another merge request | Numeric merge request ID only; its head is used only when its stable patch ID equals the target diff | Job warning names the rejected merge request | Lines stay `untracked` |
 | Compromised action or tool | Immutable action pins and pinned tool versions | Renovate, dependency review, CodeQL | Pause automation, pin or remove tool |
 | Invalid release | Tag validation, tests, archive checks, checksums, SBOM | Release workflow and manual install | Withdraw release and publish patch |
 

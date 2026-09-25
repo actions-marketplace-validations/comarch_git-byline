@@ -504,8 +504,11 @@ marks every listed parked checkpoint `droppable true`. Any blocked checkpoint
 refuses the whole cleanup; restore its recorded branch and base to consume the
 evidence, or delete every listed branch, then preview again. The command
 validates ordinary annotation before deletion, rechecks reachability, drops
-only unreachable records, and retries annotation. Hook-driven annotation
-never drops evidence automatically.
+only unreachable records, and retries annotation. Hooks never delete
+checkpoint records or drop parked evidence. A fast-forward pull does consume,
+with a warning, checkpoints on paths the pulled commits changed, because those
+edits were reverted or stashed before the pull; see
+[fast-forward pulls](docs/COMPATIBILITY.md#fast-forward-pulls).
 
 `git byline stats` abbreviates commit identifiers in its text report and
 prints the full identifiers in `--json` output, so tooling never depends on
@@ -597,6 +600,7 @@ hooks carry the same markers, backups, and uninstall symmetry everywhere:
 | --- | --- |
 | rebase, amend, cherry-pick | `post-rewrite` and `post-commit` hooks |
 | merge, pull | `post-merge` hook, first-parent authoritative |
+| fast-forward pull | `reference-transaction` hook, pulled commits keep their original notes |
 | reset soft/mixed/hard, branch switch | `reference-transaction` and `post-checkout` hooks |
 | stash push/pop/apply | stash notes under `refs/notes/byline-stash` |
 
@@ -616,16 +620,33 @@ documented limitation, not a silent guess.
 Squash and rebase merges on GitHub or GitLab create commits that never passed
 a local hook. `git byline ci install` writes a least-privilege workflow;
 `install-hooks --git` creates the same workflow automatically when the
-origin remote is github.com or gitlab.com. `git byline ci run` reconstructs
-attribution from the pull request commits, pairing by patch ID for rebase
-merges and folding in commit order for squashes. The binary writes notes
-locally; the workflow pushes the notes ref through Git, exactly like the
-pre-push hook. `uninstall` removes the workflow only while it still matches
-the generated template byte for byte.
+origin remote is github.com or gitlab.com. The workflow installs the
+git-byline release pinned on its `GIT_BYLINE_VERSION` line, the release that
+wrote it, and checks the archive against that release's `checksums.txt`.
+Then `git byline ci run` reconstructs attribution from the pull request
+commits, pairing by patch ID for rebase merges and folding in commit order
+for squashes. The binary writes notes locally; the workflow pushes the notes
+ref through Git, exactly like the pre-push hook. `uninstall` removes the
+workflow only while it still matches the generated template; only the
+pinned release tag may differ.
 
-Prefer a marketplace action over running repository code? The same
-reconstruction ships as a composite action that installs a
-checksum-verified release binary:
+On GitLab, CI/CD variables change the download without editing the file:
+`GIT_BYLINE_VERSION` pins another release and `GIT_BYLINE_RELEASES_URL`
+points at an internal mirror of the GitHub release assets.
+
+On GitLab, a squash merge keeps the merge request commits, and their notes,
+only on the merge request head. The job finds that head through the
+`group/project!123` reference in the merged commit message and uses it only
+when its diff matches the merged commit exactly. The default merge commit
+template carries that reference. With the fast-forward merge method, add
+`%{reference}` to the squash commit template under Settings > Merge
+requests, because the default one holds only the title. Without the
+reference, or when the diffs differ, the squashed lines stay `untracked`.
+Rebase merge requests locally, where the managed hooks carry attribution to
+the new commits; GitLab's server-side rebase creates commits no hook sees.
+
+On GitHub the same reconstruction also ships as a composite action, so a
+workflow can call it instead of carrying the generated steps:
 
 ```yaml
 - uses: comarch/git-byline@v1
@@ -681,13 +702,17 @@ What makes it different:
 
 The closest category peer is
 [Git AI](https://github.com/git-ai-project/git-ai). Both use agent
-checkpoints, line-level provenance, and Git notes. Git AI adds prompt-linked
-provenance and lifecycle observability; git-byline intentionally excludes
-prompts, transcripts, cloud sync, hosted analytics, accounts, daemons, and
-background network calls, and instead covers history rewrites, shell-written
-files, interop, forge merges, policy gates, and disclosure output. Choose the
-broader model when prompt context is required. Choose git-byline when local
-operation, prompt exclusion, and a small trust boundary matter more.
+checkpoints, line-level provenance, and Git notes, and both follow history
+rewrites and forge merges. Git AI adds prompt-linked provenance, a background
+daemon, and team analytics; git-byline intentionally excludes prompts,
+transcripts, cloud sync, hosted analytics, accounts, daemons, telemetry, and
+background network calls, and adds policy gates, disclosure output, and Git AI
+interop. [Entire](https://github.com/entireio/cli) records whole agent
+sessions next to commits, and
+[Cursor Blame](https://cursor.com/docs/integrations/cursor-blame) covers code
+written in Cursor. Choose a broader tool when prompt or session context is
+required. Choose git-byline when local operation, prompt exclusion, and a
+small trust boundary matter more.
 
 git-byline is not a productivity score, AI detector, or compliance
 certificate. It is a small provenance primitive for teams that want stronger
@@ -706,9 +731,11 @@ git-byline stores:
 - `refs/notes/byline-stash`
 - `refs/notes/byline-stash-owner`
 
-Linked worktrees keep checkpoint state separate. Notes are shared within the
-common repository. After `install-hooks --git`, the managed `pre-push` hook
-publishes `refs/notes/byline` to the same remote before the branch push.
+Linked worktrees keep checkpoint state separate. An agent hook that runs in
+one worktree records an edit in another worktree of the same repository in
+that worktree's state. Notes are shared within the common repository. After
+`install-hooks --git`, the managed `pre-push` hook publishes
+`refs/notes/byline` to the same remote before the branch push.
 Notes disclose repository paths, agent and model names, human identity
 tokens, session identifiers, timestamps, blob IDs, and line ranges. The
 identity token is derived from the commit author Git already publishes in
@@ -748,6 +775,11 @@ content was reviewed for sharing.
   ID and `1` to keep its pending attribution note.
 - Merge commits use first-parent history. Unmatched merge result content is
   `untracked`, and a later commit touching that content keeps it untracked.
+- A fast-forward pull writes no local notes for the pulled commits. Fetch
+  `refs/notes/byline` before the next commit, or lines it inherits from them
+  stay `untracked` in the files it changes. Agent edits stashed before the
+  pull, including by `--autostash`, lose agent attribution on paths the pulled
+  commits changed.
 - Human identity is the commit author, not a proof of keystrokes. Lines from
   notes written before identities existed aggregate as `(unidentified)`.
 - Duplicate equal lines in partial commits are resolved deterministically, but
@@ -786,6 +818,7 @@ Start with the [documentation map](docs/README.md).
 | --- | --- |
 | Product fit and alternatives | [Why git-byline](docs/WHY_GIT_BYLINE.md) |
 | Installation paths | [Installation](docs/INSTALL.md) |
+| Team rollout on self-hosted GitLab | [Rollout](docs/ROLLOUT.md) |
 | Supported systems and agents | [Compatibility](docs/COMPATIBILITY.md) |
 | Runtime and data formats | [Architecture](docs/ARCHITECTURE.md) |
 | Interop formats and mapping | [Interop](docs/INTEROP.md) |

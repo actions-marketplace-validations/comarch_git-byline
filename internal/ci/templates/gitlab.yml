@@ -4,7 +4,7 @@
 
 git-byline-reconstruct:
   stage: .post
-  image: golang:1.24.0@sha256:98839b84b95b4aa50e7bb488fdae07e456feef65073937c8684ead428782875c # Go 1.24.0
+  image: buildpack-deps:trixie-scm@sha256:d4850751e438aed5a675c30861b95ce1be3547ff9e0243fdc645e7c1b976bb66 # Debian 13 with Git and curl
   resource_group: git-byline-notes-$CI_PROJECT_ID-$CI_DEFAULT_BRANCH
   timeout: 15m
   rules:
@@ -22,24 +22,78 @@ git-byline-reconstruct:
     GIT_CONFIG_GLOBAL: /dev/null
     GIT_CONFIG_SYSTEM: /dev/null
     GIT_BYLINE_REMOTE_URL: "$CI_PROJECT_URL"
+    GIT_BYLINE_VERSION: "v1.4.2" # x-release-please-version
+    GIT_BYLINE_RELEASES_URL: "https://github.com/comarch/git-byline/releases/download"
   script:
     - |
       set -eu
-      test -n "${GITLAB_TOKEN:-}"
-      auth_value="$GITLAB_TOKEN"
+      test -n "${GITLAB_TOKEN:-}" || {
+        echo "git-byline: set GITLAB_TOKEN to a token with the write_repository scope" >&2
+        exit 1
+      }
+      # Every Git request below carries the token in a header, so a remote
+      # without TLS would send it in cleartext.
+      case "$GIT_BYLINE_REMOTE_URL" in
+        https://*) ;;
+        *)
+          echo "git-byline: GIT_BYLINE_REMOTE_URL must be an https:// URL" >&2
+          exit 1
+          ;;
+      esac
+      # Git over HTTPS takes HTTP basic auth, PRIVATE-TOKEN works only for
+      # REST calls. GitLab accepts any user name with an access token as the
+      # password, and oauth2 also covers OAuth tokens.
+      auth_value="$(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
       empty_hooks="${CI_BUILDS_DIR:-/tmp}/git-byline-empty-hooks-${CI_JOB_ID}"
       clean_home="${CI_BUILDS_DIR:-/tmp}/git-byline-home-${CI_JOB_ID}"
-      mkdir -p "$empty_hooks" "$clean_home"
+      byline_dir="${CI_BUILDS_DIR:-/tmp}/git-byline-bin-${CI_JOB_ID}"
+      mkdir -p "$empty_hooks" "$clean_home" "$byline_dir"
+      # CI_BUILDS_DIR can outlive the job, so a failed check or run must not
+      # leave the download behind.
+      trap 'rm -rf "$byline_dir"' EXIT
       export HOME="$clean_home"
       export XDG_CONFIG_HOME="$clean_home/config"
       mkdir -p "$XDG_CONFIG_HOME"
+      printf '%s\n' "$GIT_BYLINE_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+        echo "git-byline: GIT_BYLINE_VERSION must be a release tag like v1.2.3" >&2
+        exit 1
+      }
+      case "$(uname -m)" in
+        x86_64 | amd64) byline_arch=amd64 ;;
+        aarch64 | arm64) byline_arch=arm64 ;;
+        *)
+          echo "git-byline: unsupported runner architecture $(uname -m)" >&2
+          exit 1
+          ;;
+      esac
+      archive="git-byline_${GIT_BYLINE_VERSION#v}_linux_${byline_arch}.tar.gz"
+      release_url="$GIT_BYLINE_RELEASES_URL/$GIT_BYLINE_VERSION"
+      curl -q -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$byline_dir/$archive" "$release_url/$archive"
+      curl -q -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$byline_dir/checksums.txt" "$release_url/checksums.txt"
+      expected="$(awk -v name="$archive" '$2 == name || $2 == "*" name { print $1 }' "$byline_dir/checksums.txt")"
+      printf '%s' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$' || {
+        echo "git-byline: missing or invalid checksum for $archive" >&2
+        exit 1
+      }
+      actual="$(sha256sum "$byline_dir/$archive" | awk '{ print $1 }')"
+      [ "$actual" = "$expected" ] || {
+        echo "git-byline: checksum mismatch for $archive" >&2
+        exit 1
+      }
+      tar -xzf "$byline_dir/$archive" -C "$byline_dir" git-byline
+      [ "$("$byline_dir/git-byline" version)" = "git-byline $GIT_BYLINE_VERSION" ] || {
+        echo "git-byline: binary version does not match $GIT_BYLINE_VERSION" >&2
+        exit 1
+      }
       gitlab_git() {
         GIT_CONFIG_NOSYSTEM=1 \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_SYSTEM=/dev/null \
         GIT_CONFIG_COUNT=2 \
         GIT_CONFIG_KEY_0=http.extraHeader \
-        GIT_CONFIG_VALUE_0="PRIVATE-TOKEN: $auth_value" \
+        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_value" \
         GIT_CONFIG_KEY_1=credential.helper \
         GIT_CONFIG_VALUE_1="" \
         git -c remote.origin.url="$GIT_BYLINE_REMOTE_URL" "$@"
@@ -54,6 +108,41 @@ git-byline-reconstruct:
       source="${3:-$base}"
       test -n "$base"
       gitlab_git fetch --no-tags origin "$base" "$source" "$target"
+      # After a squash merge the merge request commits, and their notes,
+      # stay only on the merge request head. The default merge commit
+      # message names the merge request, so use its head as the source when
+      # its diff is exactly the diff the target commit brings.
+      mr_iid="$(git log -1 --format=%B "$target" | awk -v prefix="${CI_PROJECT_PATH}!" '
+        {
+          gsub(/[(),;]/, " ")
+          for (i = 1; i <= NF; i++) {
+            if (index($i, prefix) == 1) {
+              rest = substr($i, length(prefix) + 1)
+              sub(/[.:]$/, "", rest)
+              if (rest ~ /^[0-9]+$/) iid = rest
+            }
+          }
+        }
+        END { if (iid != "") print iid }')"
+      if [ -n "$mr_iid" ] && gitlab_git fetch --no-tags origin \
+        "+refs/merge-requests/$mr_iid/head:refs/remotes/origin/git-byline-mr-head"; then
+        mr_head="$(git rev-parse refs/remotes/origin/git-byline-mr-head)"
+        if [ "$mr_head" != "$source" ]; then
+          mr_base="$(git merge-base "$base" "$mr_head" || true)"
+          merged="$(git diff-tree -p -r --no-ext-diff --no-textconv "$base" "$target" |
+            git patch-id --stable | awk '{ print $1 }')"
+          proposed=""
+          if [ -n "$mr_base" ]; then
+            proposed="$(git diff-tree -p -r --no-ext-diff --no-textconv "$mr_base" "$mr_head" |
+              git patch-id --stable | awk '{ print $1 }')"
+          fi
+          if [ -n "$merged" ] && [ "$merged" = "$proposed" ]; then
+            source="$mr_head"
+          else
+            echo "git-byline: merge request !$mr_iid does not match $target; using commit parents" >&2
+          fi
+        fi
+      fi
       notes="$(gitlab_git ls-remote --refs origin refs/notes/byline)"
       if [ -n "$notes" ]; then
         gitlab_git fetch --no-tags origin refs/notes/byline:refs/notes/byline
@@ -64,8 +153,8 @@ git-byline-reconstruct:
       GIT_BYLINE_CI_BASE="$base" \
       GIT_BYLINE_CI_SOURCE="$source" \
       GIT_BYLINE_CI_TARGET="$target" \
-      CGO_ENABLED=0 GOPROXY=off \
-        go run ./cmd/git-byline ci run --provider gitlab
+        "$byline_dir/git-byline" ci run --provider gitlab
+      rm -rf "$byline_dir"
       push_hooks="$(mktemp -d "${CI_BUILDS_DIR:-/tmp}/git-byline-push-hooks.XXXXXX")"
       mkdir -p "$push_hooks"
       gitlab_git remote set-url origin "$GIT_BYLINE_REMOTE_URL"

@@ -80,20 +80,32 @@ func TestTemplatesSecurityContract(t *testing.T) {
 				"git remote set-url origin",
 				"GIT_BYLINE_PUSH_HOOKS",
 				"git config --local user.name git-byline-ci",
-				`go-version: "1.27.1"`,
 				`GIT_BYLINE_CI_BASE=%s`,
 				// GitHub git endpoints reject bearer auth with 401, so the
 				// workflow must authenticate with HTTP basic.
 				`GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"`,
+				"github.event.repository.default_branch",
+				"GIT_BYLINE_VERSION: v",
+				versionPinMarker,
+				"https://github.com/comarch/git-byline/releases/download/$GIT_BYLINE_VERSION",
+				"--proto '=https' --proto-redir '=https' --tlsv1.2",
+				`"$release_url/checksums.txt"`,
+				`sha256sum "$dir/$archive"`,
+				`[ "$("$dir/git-byline" version)" = "git-byline $GIT_BYLINE_VERSION" ]`,
+				"run: git-byline ci run --provider github",
 			},
 			forbidden: []string{
 				"AUTHORIZATION: bearer",
+				"go run",
+				"setup-go",
+				"GOPROXY",
+				"branches:",
 			},
 		},
 		{
 			provider: ProviderGitLab,
 			required: []string{
-				"image: golang:1.24.0@sha256:",
+				"image: buildpack-deps:trixie-scm@sha256:",
 				"resource_group:",
 				"timeout: 15m",
 				`if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'`,
@@ -108,11 +120,38 @@ func TestTemplatesSecurityContract(t *testing.T) {
 				"git-byline-push-hooks",
 				`source="${3:-$base}"`,
 				"unset GITLAB_TOKEN",
+				`GIT_BYLINE_VERSION: "v`,
+				versionPinMarker,
+				`GIT_BYLINE_RELEASES_URL: "https://github.com/comarch/git-byline/releases/download"`,
+				"--proto '=https' --proto-redir '=https' --tlsv1.2",
+				`"$release_url/checksums.txt"`,
+				`sha256sum "$byline_dir/$archive"`,
+				`[ "$("$byline_dir/git-byline" version)" = "git-byline $GIT_BYLINE_VERSION" ]`,
+				`"$byline_dir/git-byline" ci run --provider gitlab`,
+				`rm -rf "$byline_dir"`,
+				`trap 'rm -rf "$byline_dir"' EXIT`,
+				// GitLab Git over HTTPS takes HTTP basic auth with the
+				// token as password; PRIVATE-TOKEN is a REST header.
+				`auth_value="$(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"`,
+				`GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_value"`,
+				// The token header must never go to a remote without TLS.
+				`https://*) ;;`,
+				`echo "git-byline: GIT_BYLINE_REMOTE_URL must be an https:// URL" >&2`,
+				// A squash merge keeps notes only on the merge request
+				// head, used when its diff matches the target commit.
+				`awk -v prefix="${CI_PROJECT_PATH}!"`,
+				`"+refs/merge-requests/$mr_iid/head:refs/remotes/origin/git-byline-mr-head"`,
+				"git patch-id --stable",
+				`[ "$merged" = "$proposed" ]`,
+				`source="$mr_head"`,
 			},
 			forbidden: []string{
 				"merged_result",
 				"CI_MERGE_REQUEST_EVENT_TYPE",
 				"api",
+				"go run",
+				"GOPROXY",
+				"PRIVATE-TOKEN:",
 			},
 		},
 	}
@@ -134,6 +173,56 @@ func TestTemplatesSecurityContract(t *testing.T) {
 				if strings.Contains(template, value) {
 					t.Errorf("template contains forbidden %q", value)
 				}
+			}
+		})
+	}
+}
+
+func TestGitLabTemplateRefusesRemoteWithoutTLS(t *testing.T) {
+	t.Parallel()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh is not available")
+	}
+	data, err := Template(ProviderGitLab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := string(data)
+	start := strings.Index(template, "set -eu")
+	end := strings.Index(template, `auth_value="$(`)
+	if start < 0 || end < start {
+		t.Fatal("GitLab script lacks set -eu before auth_value")
+	}
+	// Only the part before the token header is built runs, so a check
+	// moved after auth_value fails here too. Windows checkouts may use CRLF.
+	prefix := strings.ReplaceAll(template[start:end], "\r\n", "\n")
+	tests := []struct {
+		name   string
+		url    string
+		wantOK bool
+	}{
+		{"https", "https://gitlab.example.invalid/group/project", true},
+		{"http", "http://gitlab.example.invalid/group/project", false},
+		{"ssh", "ssh://git@gitlab.example.invalid/group/project.git", false},
+		{"scp-like", "git@gitlab.example.invalid:group/project.git", false},
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			command := exec.Command(sh, "-c", prefix)
+			command.Env = append(os.Environ(), "GITLAB_TOKEN=token", "GIT_BYLINE_REMOTE_URL="+tt.url)
+			output, err := command.CombinedOutput()
+			if tt.wantOK {
+				if err != nil {
+					t.Fatalf("remote %q refused: %v\n%s", tt.url, err, output)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(string(output), "GIT_BYLINE_REMOTE_URL must be an https:// URL") {
+				t.Fatalf("remote %q: error = %v, output = %q, want refusal", tt.url, err, output)
 			}
 		})
 	}
@@ -185,6 +274,132 @@ func TestInstallWorkflowIsIdempotentAndNonDestructive(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTemplatesPinOneRelease(t *testing.T) {
+	t.Parallel()
+	var tags []string
+	for _, provider := range []Provider{ProviderGitHub, ProviderGitLab} {
+		template, err := Template(provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tag, err := PinnedVersion(template)
+		if err != nil {
+			t.Fatalf("PinnedVersion(%s) = %v", provider, err)
+		}
+		tags = append(tags, tag)
+	}
+	if tags[0] != tags[1] || !releaseTagPattern.MatchString(tags[0]) {
+		t.Fatalf("templates pin %q, want the same release tag", tags)
+	}
+}
+
+func TestPinnedVersionRejectsAmbiguousPins(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"no pin line", "name: x\n", "one version pin line, found 0"},
+		{
+			"two pin lines",
+			"a: v1.0.0 # x-release-please-version\nb: v1.0.0 # x-release-please-version\n",
+			"one version pin line, found 2",
+		},
+		{"no tag", "a: latest # x-release-please-version\n", "one release tag, found 0"},
+		{"two tags", "a: v1.0.0 v1.0.1 # x-release-please-version\n", "one release tag, found 2"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := PinnedVersion([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("PinnedVersion() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesTemplateAllowsOnlyAnotherReleaseTag(t *testing.T) {
+	t.Parallel()
+	template := "name: x\nversion: v1.4.2 # x-release-please-version\nexample: v1.4.2\n"
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"identical", template, true},
+		{"older release", "name: x\nversion: v1.3.0 # x-release-please-version\nexample: v1.4.2\n", true},
+		{"longer release", "name: x\nversion: v1.10.12 # x-release-please-version\nexample: v1.4.2\n", true},
+		{"tag outside pin line", "name: x\nversion: v1.4.2 # x-release-please-version\nexample: v1.3.0\n", false},
+		{"prerelease tag", "name: x\nversion: v1.4.2-rc.1 # x-release-please-version\nexample: v1.4.2\n", false},
+		{"not a tag", "name: x\nversion: latest # x-release-please-version\nexample: v1.4.2\n", false},
+		{"other edit", "name: y\nversion: v1.4.2 # x-release-please-version\nexample: v1.4.2\n", false},
+		{"marker removed", "name: x\nversion: v1.4.2\nexample: v1.4.2\n", false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := matchesTemplate([]byte(tt.data), []byte(template)); got != tt.want {
+				t.Fatalf("matchesTemplate() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkflowPinnedToAnotherReleaseStaysManaged(t *testing.T) {
+	t.Parallel()
+	for _, provider := range []Provider{ProviderGitHub, ProviderGitLab} {
+		provider := provider
+		t.Run(string(provider), func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			first, err := Install(root, provider)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, filepath.FromSlash(first.Path))
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			older := repinRelease(data, "v0.9.10")
+			if bytes.Equal(older, data) {
+				t.Fatal("test fixture did not change the release tag")
+			}
+			if err := os.WriteFile(path, older, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			second, err := Install(root, provider)
+			if err != nil || second.Changed {
+				t.Fatalf("Install() over an older pin = %+v, %v, want unchanged", second, err)
+			}
+			kept, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(kept, older) {
+				t.Fatal("Install() rewrote a workflow pinned to another release")
+			}
+			removed, err := Uninstall(root)
+			if err != nil || len(removed) != 1 || removed[0] != first.Path {
+				t.Fatalf("Uninstall() = %v, %v, want %q removed", removed, err, first.Path)
+			}
+		})
+	}
+}
+
+func repinRelease(data []byte, tag string) []byte {
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	for index, line := range lines {
+		if bytes.Contains(line, []byte(versionPinMarker)) {
+			lines[index] = releaseTagPattern.ReplaceAllLiteral(line, []byte(tag))
+		}
+	}
+	return bytes.Join(lines, nil)
 }
 
 func TestInstallRejectsSymlink(t *testing.T) {

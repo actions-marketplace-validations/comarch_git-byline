@@ -76,20 +76,42 @@ attached directly to `HEAD`, with limits of 16 MiB for the note, 500 files,
 11. Unless installed with `--local-notes`, a managed `pre-push` hook
     publishes the notes ref before an ordinary branch push.
 
+Agent hooks often run in the main checkout, for example after
+`cd "$FACTORY_PROJECT_DIR"`, while the agent edits a linked worktree. So
+`checkpoint` records each edit path in the worktree of the same repository
+that owns it. The owner is the innermost worktree root from
+`git worktree list` that contains the resolved path, so a linked worktree
+nested in the main checkout wins over the main checkout. Each candidate is
+reopened and must report the same root and the same common Git directory.
+The path moves in the form the owner's own hook would send: an absolute path
+as it is, a relative path relative to the owner root. So symlinks get the
+same checks in both worktrees, and a relative path that reaches another
+worktree only through a symlink stays in the hook's worktree and is rejected.
+The owning worktree applies the usual path checks and keeps the checkpoint in
+its own log and retention ref. Paths outside every worktree of the repository
+stay rejected. Shell events still use the dirty paths of the worktree where
+the hook runs.
+
 If annotation starts after new edits already happened on the new `HEAD`,
 checkpoints based on that `HEAD` are carried into pending state for the next
 commit. A checkpoint from another branch or base parks with a warning instead
 of blocking annotation; its lane resumes only when both branch ref and base
 match again. Post-rewrite handling remaps checkpoint and lane bases for the
-rewritten branch. `recover` previews each parked checkpoint, its recorded
-branch context, object availability, and branches that still reach its base
-without changing state. `recover --drop` first validates ordinary annotation,
-then rechecks reachability, drops only parked checkpoints whose base no local
-or remote-tracking branch can reach, and retries annotation. Every unrelated
-checkpoint must be stranded; one blocked checkpoint refuses the whole cleanup
-without dropping records or retrying annotation. Hook-driven annotation never
-selects this destructive mode. `annotate --drop-stranded` performs the same
-destructive removal without a preview, so users should run `recover` first.
+rewritten branch. A merge or pull fast-forward brings commits made elsewhere,
+so annotation skips them instead of guessing, and the boundary moves only to a
+tip that already carries a valid note. Pending ranges and checkpoints on the
+old tip move to the new tip, except on paths the fast-forward changed: there
+pending ranges are dropped and checkpoints are consumed with a warning.
+`recover` previews each parked
+checkpoint, its recorded branch context, object availability, and branches
+that still reach its base without changing state. `recover --drop` first
+validates ordinary annotation, then rechecks reachability, drops only parked
+checkpoints whose base no local or remote-tracking branch can reach, and
+retries annotation. Every unrelated checkpoint must be stranded; one blocked
+checkpoint refuses the whole cleanup without dropping records or retrying
+annotation. Hook-driven annotation never selects this destructive mode.
+`annotate --drop-stranded` performs the same destructive removal without a
+preview, so users should run `recover` first.
 
 ## Checkpoint log
 
@@ -103,7 +125,9 @@ One JSON object per line:
 
 Properties:
 
-- append-only except for truncated-tail recovery;
+- new records are appended; existing records change only through
+  truncated-tail recovery, base and lane rewrites, and explicit
+  `recover --drop` or `annotate --drop-stranded` removal;
 - streamed with a 64 MiB total limit and 100,000-record limit;
 - sequence order is authoritative;
 - one truncated final line is ignored with a warning;
@@ -137,16 +161,28 @@ remain reachable through `refs/worktree/byline/checkpoints`.
 Version 3 nests stable lane IDs below their attached local branch ref in
 `lanes`. Each lane stores the highest sequence annotation consumed in that
 branch context. Base commits remain on checkpoint records and may change when
-history is rewritten; lane IDs do not. This prevents squash or split rewrites
-from merging independent consumption watermarks. Annotation selects records
-whose branch matches the current branch and whose base matches `HEAD` or its
-first parent. Records based on the parent replay into the commit, records based
-on `HEAD` carry as pending worktree provenance, and every other unconsumed
+history is rewritten; lane IDs change only when a fast-forward splits a lane.
+This prevents squash or split rewrites from merging independent consumption
+watermarks. Annotation selects records whose branch matches the current branch
+and whose base matches `HEAD` or its first parent. Records based on the parent
+replay into the commit, records based on `HEAD` carry as pending worktree
+provenance, and every other unconsumed
 record parks with a warning. This keeps sibling branches created from one base
 independent. Parked lanes stay protected by the retention ref, are never
 deleted automatically, and resume only when branch and base match again.
 `annotate --drop-stranded` and `recover --drop` are the only paths that remove
 records, and both refuse while any branch still reaches a parked base.
+
+A fast-forward that changes a path with checkpoints on the old tip splits
+their lanes. Checkpoints on unchanged paths keep their lane and move to the
+new tip. Checkpoints on changed paths stay on the old tip and move to a lane
+named after the last of them, which is consumed up to that sequence at once.
+Lane IDs name the checkpoint that opened the lane, so the new name matches an
+existing lane only when that last checkpoint opened it. Every unchanged-path
+checkpoint in that lane then comes after it and stays above the watermark.
+Version 1 checkpoints and `legacy:<base>` lanes cannot be split. When the
+fast-forward changes one of their paths, every checkpoint on the old tip stays
+parked there.
 
 `last_checkpoint_seq` is the version 1 scalar watermark, kept as a frozen
 consumption floor. Version 1 could only consume an unbroken journal prefix,
@@ -269,13 +305,15 @@ files. A bounded greedy alignment prevents quadratic memory use on large line
 sets. Duplicate lines use stable positional tie-breaking.
 
 Files larger than 64 MiB or 1,000,000 lines, binary data, invalid UTF-8,
-symlinks, submodules, devices, ignored paths, and paths escaping the active
-worktree are rejected or skipped.
+symlinks, submodules, devices, ignored paths, and paths escaping the
+worktree that owns them are rejected or skipped.
 
 ## Worktrees and locking
 
 Each linked worktree has separate checkpoints, state, pending blobs, retention
 ref, and operation lock. Notes remain common because they are keyed by commit.
+A checkpoint for an edit in another worktree takes only that worktree's
+operation lock. `checkpoint` never holds two worktree locks at once.
 
 Annotation acquires the common notes lock before the worktree operation lock.
 Locks use operating-system advisory file locking and release automatically
@@ -293,8 +331,10 @@ later branch update will be accepted.
 When the origin remote is github.com or gitlab.com, `install-hooks --git`
 also creates the forge attribution workflow, so squash and rebase merges
 keep attribution. Detection reads `remote.origin.url` locally and is
-skipped for `--local-notes` and `--template` scope. `uninstall` removes
-the workflow only while it matches the embedded template byte for byte.
+skipped for `--local-notes` and `--template` scope. The workflow installs
+the git-byline release pinned on its version line. `uninstall` removes the
+workflow only while it matches the embedded template; only the pinned
+release tag may differ.
 
 Use `--local-notes` to install `post-commit` annotation without the sharing
 hook. Fetch shared notes into another clone explicitly:
@@ -304,8 +344,10 @@ git fetch origin refs/notes/byline:refs/notes/byline
 ```
 
 Concurrent clones can create divergent notes histories. The managed hook
-refuses a non-fast-forward notes update and stops the branch push. Merge the
-remote notes explicitly, review conflicts, then retry:
+refuses a non-fast-forward notes update and stops the branch push. A
+fast-forward pull writes no local notes for the pulled commits, so their notes
+from another clone or the forge workflow merge without conflicting entries.
+Merge the remote notes explicitly, review conflicts, then retry:
 
 ```sh
 git fetch origin refs/notes/byline:refs/notes/byline-remote

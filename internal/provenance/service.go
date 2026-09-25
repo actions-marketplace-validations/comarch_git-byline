@@ -38,7 +38,39 @@ type CaptureResult struct {
 	Warnings []string
 }
 
-// Capture records one normalized agent event.
+// CaptureEvent records one normalized agent event. Edit paths are recorded
+// in the worktree of the repository that owns them, so a hook that runs in
+// one worktree still records an agent edit in another. Shell events stay
+// with repo because their paths come from its own dirty state.
+func CaptureEvent(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResult, error) {
+	if (event.Kind != "" && event.Kind != model.CheckpointKindEdit) || len(event.Paths) == 0 {
+		return Capture(repo, event, now)
+	}
+	routes, warnings, err := repo.RouteWorktreePaths(event.Paths)
+	if err != nil {
+		return CaptureResult{}, fmt.Errorf("route checkpoint paths: %w", err)
+	}
+	result := CaptureResult{Warnings: warnings}
+	for _, route := range routes {
+		routed := event
+		routed.Paths = route.Paths
+		captured, err := Capture(route.Repo, routed, now)
+		prefix := ""
+		if route.Repo != repo {
+			prefix = fmt.Sprintf("worktree %q: ", route.Repo.Root)
+		}
+		if err != nil {
+			return CaptureResult{}, fmt.Errorf("%s%w", prefix, err)
+		}
+		result.Recorded += captured.Recorded
+		for _, warning := range captured.Warnings {
+			result.Warnings = append(result.Warnings, prefix+warning)
+		}
+	}
+	return result, nil
+}
+
+// Capture records one normalized agent event in repo.
 func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResult, error) {
 	if event.Type != model.AuthorHuman && event.Type != model.AuthorAI {
 		return CaptureResult{}, fmt.Errorf("unsupported event author %q", event.Type)
@@ -426,7 +458,7 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	// A rebase replay creates commits without fresh checkpoint evidence.
 	// Annotating them would guess attribution and then block the post-rewrite
 	// remap of the real evidence, so replayed commits wait for post-rewrite.
-	action, err := repo.HeadReflogAction()
+	action, fastForward, err := repo.HeadReflogAction()
 	if err != nil {
 		return AnnotateResult{}, err
 	}
@@ -436,6 +468,19 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 			Skipped: true,
 			Warnings: []string{
 				"skipped annotate: rebase replay created this commit; post-rewrite will remap attribution",
+			},
+		}, nil
+	}
+	// A fast-forward brings commits made in another clone or on the forge.
+	// This clone has no evidence for them, and pre-push would share a
+	// guessed note that conflicts with the note from their author or the
+	// forge workflow.
+	if fastForward {
+		return AnnotateResult{
+			Commit:  head,
+			Skipped: true,
+			Warnings: []string{
+				"skipped annotate: HEAD fast-forwarded to existing commits; fetch refs/notes/byline for their attribution",
 			},
 		}, nil
 	}
@@ -469,7 +514,9 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 	if state.LastAnnotatedCommit != "" && state.LastAnnotatedCommit != parent {
 		return AnnotateResult{}, fmt.Errorf("commit gap or divergent history: last annotated %s, HEAD parent %s", state.LastAnnotatedCommit, parent)
 	}
-	if state.LastAnnotatedCommit == "" && parent != "" {
+	// A parent note fetched after HEAD moved, such as the forge note for a
+	// pulled commit, continues attribution even though the boundary is empty.
+	if state.LastAnnotatedCommit == "" && parent != "" && annotationBoundary(repo, parent) == "" {
 		warnings = append(warnings, "initializing attribution on a repository with existing history")
 	}
 

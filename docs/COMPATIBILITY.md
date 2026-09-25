@@ -82,12 +82,14 @@ portable preset reads both, including `trajectory_id` as the session and
 Shell hooks are supported for Droid, Claude Code, and the nine portable agent
 surfaces. The pre-shell checkpoint records the dirty worktree paths and their
 blob IDs. The post-shell checkpoint records only paths whose current blob
-differs from the pre-shell snapshot. Paths come from Git status, not from the
-shell payload. When a shell payload carries a tool call or event identifier,
-git-byline stores it and pairs the post event with the matching pre event.
-Without an identifier, it pairs the post event with the latest unpaired
-pre-shell checkpoint. Concurrent overlapping shell commands without
-identifiers remain a documented race limitation.
+differs from the pre-shell snapshot. Paths come from Git status in the
+worktree where the hook runs, not from the shell payload, so a shell command
+that edits another linked worktree is not attributed to the agent. When a
+shell payload carries a tool call or event identifier, git-byline stores it
+and pairs the post event with the matching pre event. Without an identifier,
+it pairs the post event with the latest unpaired pre-shell checkpoint.
+Concurrent overlapping shell commands without identifiers remain a
+documented race limitation.
 
 Blob comparison avoids claiming unrelated dirty files merely because they were
 already present. It does not remove the concurrent-edit race: a human edit to a
@@ -109,6 +111,9 @@ Track native support in
 
 - First-parent history is authoritative.
 - Linked worktrees receive separate pending state.
+- An edit is recorded in the worktree of the same repository that owns the
+  path, also when the agent hook runs in another worktree, such as the main
+  checkout.
 - SHA-1 and longer opaque object IDs are accepted.
 - Partial commits preserve excluded provenance for the next commit.
 - Renames preserve provenance through Git rename detection.
@@ -124,6 +129,7 @@ Track native support in
 | Amend | Supported | `post-rewrite` and `post-commit` | Unstaged and partially staged amend |
 | Cherry-pick | Supported | `post-commit` | Normal `-x` cherry-pick; `--no-commit` requires a commit message marker |
 | Merge | Supported | `post-merge` and `post-commit` | First parent authoritative; conflict resolution is untracked |
+| Fast-forward pull or merge | Supported | `reference-transaction` | Pulled commits keep their original notes; pending work moves to the new tip |
 | Pull with rebase | Supported | `post-rewrite` | Rewritten local commits |
 | Reset soft | Supported | `reference-transaction` | Pending ranges reproject onto worktree |
 | Reset mixed | Supported | `reference-transaction` | Pending ranges reproject onto worktree |
@@ -149,6 +155,34 @@ Restored stash ranges merge with existing pending state. Existing entries win
 for a path already present; restored entries fill paths not already pending.
 The operation lock covers the complete read, projection, retention, and state
 write sequence.
+
+## Fast-forward pulls
+
+A fast-forward pull or merge moves the branch to commits made in another clone
+or by the forge merge workflow. This clone has no evidence for them, so
+`post-merge` annotation skips them with a warning. A guessed local note would
+conflict with their real note on the next notes push. Fetch their notes after
+the pull and before the next commit:
+
+```sh
+git fetch origin refs/notes/byline:refs/notes/byline
+```
+
+A commit made before those notes arrive marks lines it inherits from the
+pulled commits as `untracked` in the files it changes. The attribution
+boundary moves to the new tip only when that tip already carries a valid note.
+
+Git refuses a fast-forward that would overwrite local changes, and
+`--autostash` applies the stash only after the branch moves. So a path the
+pulled commits changed was clean, and its pending ranges and checkpoints
+describe edits that were reverted or stashed before the pull. The pull drops
+those pending ranges, so the next commit reads the path from the new tip and
+its note. Replaying the checkpoints over the incoming content would attribute
+lines they never produced, so the pull consumes them with a warning. Agent
+edits stashed before such a pull, including by `--autostash`, lose agent
+attribution on those paths and commit as `human` lines after the stash is
+applied. Pending ranges and checkpoints on paths the pull did not change move
+to the new tip and keep their attribution.
 
 ## Attribution matching
 
