@@ -207,6 +207,130 @@ git --git-dir="$WORK/remote.git" notes --ref=byline list >/dev/null || fail "not
 NOTES_COUNT="$(git --git-dir="$WORK/remote.git" notes --ref=byline list | wc -l | tr -d ' ')"
 [[ "$NOTES_COUNT" -ge 1 ]] || fail "notes missing on remote: $NOTES_COUNT"
 
+step "pre-push merges notes another clone pushed"
+# The other clone plays a teammate or the forge job. An empty template keeps
+# hooks from a user-level Git template out of it.
+OTHER="$WORK/other"
+git clone -q --template= "$WORK/remote.git" "$OTHER" || fail "clone other"
+git -C "$OTHER" config user.name "Other Clone"
+git -C "$OTHER" config user.email "other.clone@example.invalid"
+git -C "$OTHER" config core.autocrlf false
+git -C "$OTHER" fetch -q origin refs/notes/byline:refs/notes/byline || fail "other fetch notes"
+git -C "$OTHER" checkout -q -b side || fail "other side branch"
+printf 'side\n' >"$OTHER/side.txt"
+git -C "$OTHER" add side.txt
+git -C "$OTHER" commit -qm "feat: side" || fail "other side commit"
+SIDE="$(git -C "$OTHER" rev-parse HEAD)"
+git -C "$OTHER" notes --ref=byline add -m "other clone note" "$SIDE" || fail "other note"
+git -C "$OTHER" push -q origin side refs/notes/byline || fail "other push"
+printf 'merge line\n' >merge.txt
+printf '%s' '{"session_id":"m1","tool_name":"Write","tool_input":{"file_path":"merge.txt"},"model":"m"}' \
+  | "$BIN" checkpoint claude --type ai --hook-input stdin >/dev/null || fail "merge checkpoint"
+git add merge.txt
+git commit -qm "feat: after other clone" || fail "commit after other clone"
+MERGED="$(git rev-parse HEAD)"
+PUSH_OUT="$(git push -q origin main 2>&1)" || fail "push with diverged notes: $PUSH_OUT"
+require "notes merge message" "$PUSH_OUT" "git-byline: merged remote attribution notes, 1 added"
+require "merged local notes" "$(git notes --ref=byline list)" "$SIDE"
+REMOTE_NOTES="$(git --git-dir="$WORK/remote.git" notes --ref=byline list)"
+require "other clone note on remote" "$REMOTE_NOTES" "$SIDE"
+require "new note on remote" "$REMOTE_NOTES" "$MERGED"
+if git show-ref --verify --quiet refs/worktree/byline/remote-notes; then
+  fail "fetched notes ref left behind"
+fi
+
+step "pre-push fast-forwards notes that are behind"
+git -C "$OTHER" fetch -q origin refs/notes/byline:refs/notes/byline || fail "other fetch merged notes"
+printf 'side two\n' >>"$OTHER/side.txt"
+git -C "$OTHER" commit -qam "feat: side two" || fail "other second commit"
+SIDE_TWO="$(git -C "$OTHER" rev-parse HEAD)"
+git -C "$OTHER" notes --ref=byline add -m "other clone second note" "$SIDE_TWO" || fail "other second note"
+git -C "$OTHER" push -q origin side refs/notes/byline || fail "other second push"
+PUSH_OUT="$(git push -q origin HEAD:refs/heads/notes-behind 2>&1)" || fail "push with notes behind: $PUSH_OUT"
+require "notes fast-forward message" "$PUSH_OUT" "git-byline: updated attribution notes from the remote, 1 added"
+[[ "$(git rev-parse refs/notes/byline)" == "$(git --git-dir="$WORK/remote.git" rev-parse refs/notes/byline)" ]] ||
+  fail "local notes did not fast-forward to the remote"
+
+step "conflicting notes stop the push and change nothing"
+# --no-verify sends the commit without its note, then the other clone writes
+# a different note for it. Both sides now added a note for one commit.
+printf 'conflict line\n' >conflict.txt
+git add conflict.txt
+git commit -qm "feat: note on both sides" || fail "commit before conflict"
+CONFLICTED="$(git rev-parse HEAD)"
+git push -q --no-verify origin main || fail "push branch without notes"
+git -C "$OTHER" fetch -q origin main refs/notes/byline:refs/notes/byline || fail "other fetch main"
+git -C "$OTHER" notes --ref=byline add -m "conflicting note" "$CONFLICTED" || fail "conflicting note"
+git -C "$OTHER" push -q origin refs/notes/byline || fail "other push conflicting note"
+printf 'after conflict\n' >>conflict.txt
+git commit -qam "feat: push after conflict" || fail "commit after conflict"
+REMOTE_NOTES="$(git --git-dir="$WORK/remote.git" rev-parse refs/notes/byline)"
+REMOTE_MAIN="$(git --git-dir="$WORK/remote.git" rev-parse refs/heads/main)"
+LOCAL_NOTES="$(git rev-parse refs/notes/byline)"
+if PUSH_OUT="$(git push -q origin main 2>&1)"; then
+  fail "push went through conflicting notes"
+fi
+require "conflict names the commit" "$PUSH_OUT" "differ for commit $CONFLICTED"
+require "conflict help" "$PUSH_OUT" \
+  'git -c fetch.fsckObjects=true fetch --no-tags --refmap= "$(git remote get-url --push origin)" +refs/notes/byline:refs/notes/byline-remote'
+[[ "$(git rev-parse refs/notes/byline)" == "$LOCAL_NOTES" ]] || fail "conflict changed local notes"
+[[ "$(git --git-dir="$WORK/remote.git" rev-parse refs/notes/byline)" == "$REMOTE_NOTES" ]] ||
+  fail "conflict changed remote notes"
+[[ "$(git --git-dir="$WORK/remote.git" rev-parse refs/heads/main)" == "$REMOTE_MAIN" ]] ||
+  fail "branch went out despite the notes conflict"
+if git show-ref --verify --quiet refs/worktree/byline/remote-notes; then
+  fail "fetched notes ref left behind after conflict"
+fi
+if git rev-parse --verify --quiet NOTES_MERGE_PARTIAL >/dev/null; then
+  fail "conflict left a notes merge in progress"
+fi
+
+step "the printed manual steps resolve the conflict"
+# A notes fetch refspec makes a plain fetch of the notes overwrite the local
+# ones, so the printed fetch must keep them.
+git config --add remote.origin.fetch '+refs/notes/*:refs/notes/*'
+KEPT_NOTE="$(git notes --ref=byline show "$CONFLICTED")"
+OUT="$(git -c fetch.fsckObjects=true fetch --no-tags --refmap= "$(git remote get-url --push origin)" \
+  +refs/notes/byline:refs/notes/byline-remote 2>&1)" || fail "manual notes fetch: $OUT"
+[[ "$(git rev-parse refs/notes/byline)" == "$LOCAL_NOTES" ]] || fail "manual fetch replaced local notes"
+[[ "$(git notes --ref=refs/notes/byline-remote show "$CONFLICTED")" == "conflicting note" ]] ||
+  fail "compare step did not show the remote note"
+if git notes --ref=refs/notes/byline merge --strategy=manual refs/notes/byline-remote >/dev/null 2>&1; then
+  fail "manual notes merge did not stop at the conflict"
+fi
+MERGE_DIR="$(git rev-parse --git-path NOTES_MERGE_WORKTREE)"
+[[ -f "$MERGE_DIR/$CONFLICTED" ]] || fail "manual notes merge did not name the conflicted commit"
+# Keep the local note, like a reviewer who checked both sides.
+git notes --ref=refs/notes/byline show "$CONFLICTED" >"$MERGE_DIR/$CONFLICTED" || fail "resolve conflict"
+git notes --ref=refs/notes/byline merge --commit || fail "commit manual notes merge"
+git update-ref -d refs/notes/byline-remote || fail "remove fetched notes"
+PUSH_OUT="$(git push -q origin main 2>&1)" || fail "push after manual notes merge: $PUSH_OUT"
+[[ "$(git --git-dir="$WORK/remote.git" rev-parse refs/heads/main)" == "$(git rev-parse HEAD)" ]] ||
+  fail "branch did not go out after the manual merge"
+[[ "$(git --git-dir="$WORK/remote.git" rev-parse refs/notes/byline)" == "$(git rev-parse refs/notes/byline)" ]] ||
+  fail "notes did not go out after the manual merge"
+[[ "$(git --git-dir="$WORK/remote.git" notes --ref=byline show "$CONFLICTED")" == "$KEPT_NOTE" ]] ||
+  fail "manual merge lost the kept note"
+
+step "a remote rewrite of a local note stops the push"
+# git notes merge would take this change, because only the remote side
+# touched the note. git-byline never replaces an existing note on its own.
+MERGED_NOTE="$(git notes --ref=byline show "$MERGED")"
+git -C "$OTHER" fetch -q origin refs/notes/byline:refs/notes/byline || fail "other fetch resolved notes"
+git -C "$OTHER" notes --ref=byline add -f -m "rewritten note" "$MERGED" || fail "rewrite note"
+git -C "$OTHER" push -q origin refs/notes/byline || fail "other push rewritten note"
+if PUSH_OUT="$(git push -q origin HEAD:refs/heads/notes-rewritten 2>&1)"; then
+  fail "push went through a rewritten note"
+fi
+require "rewrite names the commit" "$PUSH_OUT" "differ for commit $MERGED"
+[[ "$(git notes --ref=byline show "$MERGED")" == "$MERGED_NOTE" ]] || fail "remote rewrite replaced the local note"
+if git --git-dir="$WORK/remote.git" show-ref --verify --quiet refs/heads/notes-rewritten; then
+  fail "branch went out despite the rewritten note"
+fi
+if git show-ref --verify --quiet refs/worktree/byline/remote-notes; then
+  fail "fetched notes ref left behind after the rewrite"
+fi
+
 step "uninstall removes managed hooks only"
 "$BIN" uninstall --git >/dev/null || fail "uninstall"
 grep -q "USER-HOOK-RAN" .git/hooks/pre-commit || fail "user hook deleted"

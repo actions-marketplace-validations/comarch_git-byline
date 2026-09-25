@@ -244,7 +244,7 @@ func changeSelectedGitHooks(
 ) ([]string, error) {
 	specs := []gitHookChange{
 		{name: "post-commit", command: postCommitCommand(executable), install: install},
-		{name: "pre-push", command: notesPushCommand(), install: install && !options.LocalNotes},
+		{name: "pre-push", command: notesPushCommand(executable), install: install && !options.LocalNotes},
 		{name: "post-rewrite", command: rewriteHookCommand(executable, "post-rewrite", true), install: install},
 		{name: "post-merge", command: postMergeCommand(executable), install: install},
 		{name: "post-checkout", command: rewriteHookCommand(executable, "post-checkout", false), install: install},
@@ -301,10 +301,60 @@ func acquireTemplateLock() (*lock.File, error) {
 	return templateLock, nil
 }
 
-func notesPushCommand() string {
-	return `if git show-ref --verify --quiet refs/notes/byline; then
+// legacyNotesPushCommand is the pre-push block from before the notes sync.
+// It stays recognized so install replaces it and uninstall removes it.
+const legacyNotesPushCommand = `if git show-ref --verify --quiet refs/notes/byline; then
   git push --no-verify -- "$1" refs/notes/byline:refs/notes/byline || exit 1
 fi`
+
+// The notes fetch is the only network step besides the notes push;
+// merge-notes merges the fetched ref offline under the notes lock.
+//   - The fetch and the notes push both use "$2", the URL this push goes
+//     to. A remote with a separate pushurl never syncs against the fetch
+//     URL, and with several push URLs Git runs the hook once per URL, so
+//     every run syncs and pushes the notes of its own URL only.
+//   - fetch.fsckObjects rejects malformed objects before they are stored,
+//     for example a tree entry name with a slash, which looks like a
+//     fanout directory to ls-tree but not to Git's notes code.
+//   - The empty --refmap keeps a configured notes fetch refspec, like
+//     +refs/notes/*:refs/notes/*, from overwriting the local notes.
+//   - --no-filter brings the note blobs into a partial clone, so nothing
+//     later has to fetch them lazily.
+//   - Only exit status 1 from merge-notes, a conflict or a failed merge,
+//     stops the push. A missing binary (127) or an older one without
+//     merge-notes (2) falls back to the plain notes push, which never
+//     forces, so it cannot overwrite remote notes.
+//   - merge-notes finds the repository from the working directory, without
+//     GIT_DIR. The sync runs only when that finds the repository Git runs
+//     the hook for, so a push with --git-dir from outside the work tree
+//     skips it. Bare repositories skip it too, because merge-notes needs a
+//     work tree. A failed fetch, for example when the remote has no notes
+//     yet, also falls back to the plain notes push.
+const (
+	notesPushPrefix = `if git show-ref --verify --quiet refs/notes/byline; then
+  if [ "$(git rev-parse --is-bare-repository)" = false ] &&
+    [ "$(git rev-parse --absolute-git-dir)" = \
+      "$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; git rev-parse --absolute-git-dir 2>/dev/null)" ] &&
+    git -c fetch.fsckObjects=true fetch --quiet --no-tags --no-recurse-submodules \
+      --no-write-fetch-head --no-auto-maintenance --no-filter --refmap= -- "$2" \
+      "+refs/notes/byline:` + gitcmd.RemoteNotesRef + `" 2>/dev/null; then
+    `
+	notesPushSuffix = ` merge-notes --remote "$1" || [ $? -ne 1 ] || exit 1
+  fi
+  git push --no-verify -- "$2" refs/notes/byline:refs/notes/byline || exit 1
+fi`
+)
+
+func notesPushCommand(executable string) string {
+	return notesPushPrefix + quoteExecutable(executable) + notesPushSuffix
+}
+
+func isNotesPushCommand(command string) bool {
+	if command == legacyNotesPushCommand {
+		return true
+	}
+	return strings.HasPrefix(command, notesPushPrefix) &&
+		commandHasGitBylineExecutable(strings.TrimPrefix(command, notesPushPrefix), notesPushSuffix)
 }
 
 func postCommitCommand(executable string) string {
@@ -1903,7 +1953,7 @@ func managedGitHookBlock(block string) bool {
 		return false
 	}
 	command := strings.TrimSuffix(strings.TrimPrefix(block, prefix), suffix)
-	return command == notesPushCommand() ||
+	return isNotesPushCommand(command) ||
 		isPostCommitCommand(command) ||
 		isPostMergeCommand(command) ||
 		commandHasGitBylineExecutable(command, " annotate || exit 1") ||
