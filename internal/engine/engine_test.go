@@ -145,6 +145,56 @@ func TestProjectLayeredLaterSourceWins(t *testing.T) {
 	}
 }
 
+func TestProjectLayeredPreservesAttributionAcrossLineEndings(t *testing.T) {
+	t.Parallel()
+	ai := model.Attribution{Author: model.AuthorAI, Agent: "droid", Model: "model"}
+	source := Snapshot{
+		Lines:        []string{"one\n", "agent\n"},
+		Attributions: []model.Attribution{{Author: model.AuthorHuman}, ai},
+	}
+	got, err := ProjectLayeredWithBudget(
+		[]Snapshot{source},
+		[]byte("one\r\nagent\r\n"),
+		model.Attribution{Author: model.AuthorUntracked},
+		NewMatcherBudget(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Attributions, source.Attributions) {
+		t.Fatalf("CRLF attribution = %+v, want %+v", got.Attributions, source.Attributions)
+	}
+}
+
+func TestExactLineKeys(t *testing.T) {
+	t.Parallel()
+	lines := []string{"lf\n", "crlf\r\n", "unterminated"}
+	want := []exactLineKey{
+		{content: "lf", terminated: true},
+		{content: "crlf", terminated: true},
+		{content: "unterminated"},
+	}
+	if got := exactLineKeys(lines); !reflect.DeepEqual(got, want) {
+		t.Fatalf("exactLineKeys() = %+v, want %+v", got, want)
+	}
+	if !exactLineEqual("same", "same") || !exactLineEqual("same\n", "same\r\n") ||
+		exactLineEqual("left\n", "right\r\n") {
+		t.Fatal("exactLineEqual returned an unexpected result")
+	}
+	if !hasCRLF(lines) || hasCRLF([]string{"lf\n"}) {
+		t.Fatal("hasCRLF returned an unexpected result")
+	}
+	pairs, err := exactPairsBudget(
+		[]string{"start\n", "left\r\n", "end\n"},
+		[]string{"start\n", "right\r\n", "end\n"},
+		NewMatcherBudget(100),
+	)
+	wantPairs := []linePair{{old: 0, new: 0}, {old: 2, new: 2}}
+	if err != nil || !reflect.DeepEqual(pairs, wantPairs) {
+		t.Fatalf("exactPairsBudget(CRLF middle) = %+v, %v, want %+v", pairs, err, wantPairs)
+	}
+}
+
 func TestProjectLayeredRejectsInvalidSource(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -846,6 +896,7 @@ func TestKeptAddedLines(t *testing.T) {
 		{"partly kept", "a\nb\n", "a\nX\nb\nY\n", "a\nX\nb\n", 2, 1},
 		{"reindented", "a\n  b\nc\n", "a\n    b\nc\n", "a\n  b\nc\n", 1, 0},
 		{"duplicate of a base line", "a\n", "a\na\n", "a\n", 1, 0},
+		{"CRLF worktree", "a\nb\n", "a\nX\nb\n", "a\r\nX\r\nb\r\n", 1, 1},
 		{"deletion only", "a\nb\n", "a\n", "a\nb\n", 0, 0},
 		{"new file", "", "x\ny\n", "x\ny\n", 2, 2},
 		{"deleted file", "a\n", "", "", 0, 0},
