@@ -16,6 +16,7 @@ import (
 	"github.com/comarch/git-byline/internal/notes"
 	"github.com/comarch/git-byline/internal/preset"
 	"github.com/comarch/git-byline/internal/store"
+	"github.com/comarch/git-byline/internal/transcript"
 )
 
 const lockTimeout = 10 * time.Second
@@ -153,7 +154,7 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 			return CaptureResult{Warnings: warnings}, nil
 		}
 		if before.BaseCommit != head ||
-			(before.Version >= model.CheckpointVersion && before.BranchRef != branchRef) {
+			(before.Version >= model.CheckpointVersionV2 && before.BranchRef != branchRef) {
 			warnings = append(warnings, "ignored shell_post with a different base or branch context")
 			return CaptureResult{Warnings: warnings}, nil
 		}
@@ -239,6 +240,22 @@ func Capture(repo *gitcmd.Repo, event preset.Event, now time.Time) (CaptureResul
 		record.Model = event.Model
 		record.Session = event.Session
 	}
+	// Usage enriches the checkpoint but is not evidence, so an unreadable
+	// transcript or an invalid block drops the usage and keeps the record.
+	if event.Type == model.AuthorAI && event.TranscriptPath != "" {
+		if usage, found, err := transcript.ResolveUsage(event.TranscriptPath); err == nil && found {
+			candidate := model.CheckpointUsage{
+				MsgID:      usage.MsgID,
+				TokensIn:   usage.TokensIn,
+				TokensOut:  usage.TokensOut,
+				CacheRead:  usage.CacheRead,
+				CacheWrite: usage.CacheWrite,
+			}
+			if model.ValidateCheckpointUsage(candidate) == nil {
+				record.Usage = &candidate
+			}
+		}
+	}
 	if err := dataStore.CheckCheckpointAppend(record, len(records)+len(logWarnings)); err != nil {
 		return CaptureResult{}, err
 	}
@@ -268,7 +285,7 @@ func currentCheckpointLaneID(
 		if checkpointConsumed(record, state) {
 			continue
 		}
-		if record.Version == model.CheckpointVersion &&
+		if record.Version >= model.CheckpointVersionV2 &&
 			record.BranchRef == branchRef &&
 			record.BaseCommit == base {
 			return record.LaneID
@@ -552,6 +569,7 @@ func Annotate(repo *gitcmd.Repo) (AnnotateResult, error) {
 		Files:   map[string]model.NoteFile{},
 	}
 	sessions := sessionMetrics{}
+	foldSessionUsage(sessions, active)
 	nextPending := map[string]model.PendingFile{}
 	identity, err := commitIdentity(repo, head)
 	if err != nil {
@@ -984,12 +1002,12 @@ func initialSnapshot(repo *gitcmd.Repo, state model.State, parent, path string) 
 		}
 		return engine.Snapshot{}, nil, err
 	}
-	file, found, warnings, err := notes.FindFile(repo, parent, path, blob)
+	note, found, warnings, err := notes.FindFile(repo, parent, path, blob)
 	if err != nil {
 		return engine.Snapshot{}, warnings, err
 	}
 	if found {
-		snapshot, err := engine.NewSnapshot(content, file.Ranges)
+		snapshot, err := engine.NewSnapshot(content, note.Files[path].Ranges)
 		if err != nil {
 			return engine.Snapshot{}, warnings, fmt.Errorf("%w: %v", errUnsupportedBase, err)
 		}
@@ -1063,6 +1081,49 @@ func transitionsFor(
 	return transitions, nil
 }
 
+// foldSessionUsage sums the token usage of the agent turns whose
+// checkpoints this annotation consumes. One assistant message can serve
+// several checkpoints in a turn, so a usage block with a message id counts
+// once per session; blocks without an id cannot be deduplicated and count
+// each time. Records without usage contribute nothing, so a checkpoint
+// written before a transcript named usage stays honestly silent.
+func foldSessionUsage(sessions sessionMetrics, records []model.Checkpoint) {
+	seen := map[string]bool{}
+	for _, record := range records {
+		if record.Usage == nil || record.Type != model.AuthorAI || record.Session == "" {
+			continue
+		}
+		attribution := model.Attribution{
+			Author:  model.AuthorAI,
+			Agent:   record.Agent,
+			Model:   record.Model,
+			Session: record.Session,
+			TS:      record.TS,
+		}
+		session := ensureSession(sessions, attribution)
+		if record.Usage.MsgID != "" {
+			key := model.NoteSessionKey(record.Agent, record.Session) +
+				model.NoteSessionSeparator + record.Usage.MsgID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		session.TokensIn = cappedUsageSum(session.TokensIn, record.Usage.TokensIn)
+		session.TokensOut = cappedUsageSum(session.TokensOut, record.Usage.TokensOut)
+		session.CacheRead = cappedUsageSum(session.CacheRead, record.Usage.CacheRead)
+		session.CacheWrite = cappedUsageSum(session.CacheWrite, record.Usage.CacheWrite)
+	}
+}
+
+func cappedUsageSum(current, value uint64) uint64 {
+	if current >= model.MaxCheckpointUsageTokens ||
+		value > model.MaxCheckpointUsageTokens-current {
+		return model.MaxCheckpointUsageTokens
+	}
+	return current + value
+}
+
 func addTransitionSessionMetrics(sessions sessionMetrics, stats []engine.TransitionStats) {
 	for _, value := range stats {
 		if value.Attribution.Author == model.AuthorAI && value.Attribution.Session != "" {
@@ -1130,6 +1191,10 @@ func materializeSessionMetrics(sessions sessionMetrics) map[string]model.NoteSes
 		if session.Accepted == 0 && session.Overridden == 0 {
 			session.Added = 0
 			session.Deleted = 0
+			session.TokensIn = 0
+			session.TokensOut = 0
+			session.CacheRead = 0
+			session.CacheWrite = 0
 		}
 		result[key] = session
 	}
@@ -1179,18 +1244,20 @@ type BlameLine struct {
 
 // BlameResult is attribution for one committed file.
 type BlameResult struct {
-	Version  int         `json:"version"`
-	File     string      `json:"file"`
-	Blob     string      `json:"blob"`
-	Commit   string      `json:"commit"`
-	Lines    []BlameLine `json:"lines"`
-	Warnings []string    `json:"warnings,omitempty"`
+	Version  int                          `json:"version"`
+	File     string                       `json:"file"`
+	Blob     string                       `json:"blob"`
+	Commit   string                       `json:"commit"`
+	Lines    []BlameLine                  `json:"lines"`
+	Sessions map[string]model.NoteSession `json:"sessions,omitempty"`
+	Warnings []string                     `json:"warnings,omitempty"`
 }
 
 // BlameCollection is attribution for every file recorded on HEAD.
 type BlameCollection struct {
 	Commit   string
 	Files    []BlameResult
+	Sessions map[string]model.NoteSession
 	Warnings []string
 }
 
@@ -1216,9 +1283,9 @@ func BlameHead(repo *gitcmd.Repo) (BlameCollection, error) {
 	if err != nil {
 		return BlameCollection{}, err
 	}
-	result := BlameCollection{Commit: head}
+	result := BlameCollection{Commit: head, Sessions: note.Sessions}
 	for index, path := range paths {
-		file, err := blameNotedFile(repo, head, path, blobs[index], note.Files[path])
+		file, err := blameNotedFile(repo, head, path, blobs[index], note.Files[path], note.Sessions)
 		if err != nil {
 			return BlameCollection{}, fmt.Errorf("blame %q: %w", path, err)
 		}
@@ -1279,7 +1346,7 @@ func BlameHeadFile(repo *gitcmd.Repo, path string) (BlameResult, error) {
 		if err != nil {
 			return BlameResult{}, err
 		}
-		result, err := blameNotedFile(repo, head, candidate, blobs[0], file)
+		result, err := blameNotedFile(repo, head, candidate, blobs[0], file, note.Sessions)
 		if err != nil {
 			return BlameResult{}, fmt.Errorf("blame %q: %w", candidate, err)
 		}
@@ -1354,7 +1421,12 @@ func preflightBlameFiles(repo *gitcmd.Repo, head string, paths []string, note mo
 	return blobs, nil
 }
 
-func blameNotedFile(repo *gitcmd.Repo, head, path, blob string, file model.NoteFile) (BlameResult, error) {
+func blameNotedFile(
+	repo *gitcmd.Repo,
+	head, path, blob string,
+	file model.NoteFile,
+	sessions map[string]model.NoteSession,
+) (BlameResult, error) {
 	normalized, err := repo.NormalizeWorktreePath(path)
 	if err != nil {
 		return BlameResult{}, err
@@ -1370,7 +1442,7 @@ func blameNotedFile(repo *gitcmd.Repo, head, path, blob string, file model.NoteF
 	if err != nil {
 		return BlameResult{}, err
 	}
-	return renderBlameResult(head, path, blob, snapshot, nil), nil
+	return renderBlameResult(head, path, blob, snapshot, sessions, nil), nil
 }
 
 // Blame reads line attribution for path at HEAD.
@@ -1415,13 +1487,15 @@ func blamePath(repo *gitcmd.Repo, head, path string) (BlameResult, error) {
 	if err != nil {
 		return BlameResult{}, err
 	}
-	file, found, warnings, err := notes.FindFile(repo, head, path, blob)
+	note, found, warnings, err := notes.FindFile(repo, head, path, blob)
 	if err != nil {
 		return BlameResult{}, err
 	}
 	var snapshot engine.Snapshot
+	var sessions map[string]model.NoteSession
 	if found {
-		snapshot, err = engine.NewSnapshot(content, file.Ranges)
+		snapshot, err = engine.NewSnapshot(content, note.Files[path].Ranges)
+		sessions = note.Sessions
 	} else {
 		var ranges []model.Range
 		ranges, err = engine.UniformRanges(content, model.Attribution{Author: model.AuthorUntracked})
@@ -1432,10 +1506,15 @@ func blamePath(repo *gitcmd.Repo, head, path string) (BlameResult, error) {
 	if err != nil {
 		return BlameResult{}, err
 	}
-	return renderBlameResult(head, path, blob, snapshot, warnings), nil
+	return renderBlameResult(head, path, blob, snapshot, sessions, warnings), nil
 }
 
-func renderBlameResult(head, path, blob string, snapshot engine.Snapshot, warnings []string) BlameResult {
+func renderBlameResult(
+	head, path, blob string,
+	snapshot engine.Snapshot,
+	sessions map[string]model.NoteSession,
+	warnings []string,
+) BlameResult {
 	lines := make([]BlameLine, len(snapshot.Lines))
 	for i, line := range snapshot.Lines {
 		line = strings.TrimSuffix(line, "\r\n")
@@ -1448,6 +1527,7 @@ func renderBlameResult(head, path, blob string, snapshot engine.Snapshot, warnin
 		Blob:     blob,
 		Commit:   head,
 		Lines:    lines,
+		Sessions: sessions,
 		Warnings: warnings,
 	}
 }

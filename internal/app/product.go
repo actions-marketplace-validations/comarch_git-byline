@@ -26,6 +26,8 @@ import (
 
 var checkpointInputTimeoutNanos atomic.Int64
 
+const jsonFlag = "--json"
+
 // checkpointArgs holds the validated checkpoint command surface.
 type checkpointArgs struct {
 	presetName string
@@ -232,6 +234,7 @@ func runDashboard(env *Env, command *command, args []string) (int, error) {
 		}
 		report.Commit = file.Commit
 		report.Files = []provenance.BlameResult{file}
+		report.Sessions = file.Sessions
 	} else {
 		collection, err := provenance.BlameHead(repo)
 		if err != nil {
@@ -239,6 +242,7 @@ func runDashboard(env *Env, command *command, args []string) (int, error) {
 		}
 		report.Commit = collection.Commit
 		report.Files = collection.Files
+		report.Sessions = collection.Sessions
 		writeWarnings(env, collection.Warnings)
 	}
 	data, err := dashboard.Render(report)
@@ -330,7 +334,7 @@ func annotateOperationalError(
 }
 
 func runBlame(env *Env, command *command, args []string) (int, error) {
-	jsonOutput, mode, rest, err := parseBlameFlags(args)
+	jsonOutput, showTokens, mode, rest, err := parseBlameFlags(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(env.Stdout, command.usage)
@@ -356,53 +360,86 @@ func runBlame(env *Env, command *command, args []string) (int, error) {
 		return ExitSuccess, nil
 	}
 	writeWarnings(env, result.Warnings)
-	writeBlameText(env.Stdout, result.Lines, useColor(mode, env.Stdout))
+	writeBlameText(env.Stdout, result.Lines, result.Sessions, useColor(mode, env.Stdout), showTokens)
 	return ExitSuccess, nil
 }
 
 // parseBlameFlags accepts the blame flags without a flag set, so the file
 // argument can follow or precede them.
-func parseBlameFlags(args []string) (bool, colorMode, []string, error) {
-	jsonOutput := false
-	mode := colorAuto
-	colorSet := false
-	var rest []string
+func parseBlameFlags(args []string) (bool, bool, colorMode, []string, error) {
+	options := blameOptions{mode: colorAuto}
 	for _, arg := range args {
-		switch {
-		case arg == "--json":
-			if jsonOutput {
-				return false, mode, nil, errors.New("--json specified more than once")
-			}
-			jsonOutput = true
-		case arg == "-h" || arg == "--help":
-			return false, mode, nil, flag.ErrHelp
-		case strings.HasPrefix(arg, "--color="):
-			if colorSet {
-				return false, mode, nil, errors.New("--color specified more than once")
-			}
-			parsed, err := parseColorMode(strings.TrimPrefix(arg, "--color="))
-			if err != nil {
-				return false, mode, nil, err
-			}
-			mode = parsed
-			colorSet = true
-		case strings.HasPrefix(arg, "-"):
-			return false, mode, nil, fmt.Errorf("unknown flag %q", arg)
-		default:
-			rest = append(rest, arg)
+		handled, err := options.parse(arg)
+		if err != nil {
+			return false, false, options.mode, nil, err
+		}
+		if !handled {
+			options.rest = append(options.rest, arg)
 		}
 	}
-	return jsonOutput, mode, rest, nil
+	return options.jsonOutput, options.showTokens, options.mode, options.rest, nil
+}
+
+type blameOptions struct {
+	jsonOutput bool
+	showTokens bool
+	mode       colorMode
+	colorSet   bool
+	rest       []string
+}
+
+func (options *blameOptions) parse(arg string) (bool, error) {
+	switch {
+	case arg == jsonFlag:
+		return true, setBlameFlag(jsonFlag, &options.jsonOutput)
+	case arg == "--tokens":
+		return true, setBlameFlag("--tokens", &options.showTokens)
+	case arg == "-h" || arg == "--help":
+		return true, flag.ErrHelp
+	case strings.HasPrefix(arg, "--color="):
+		if options.colorSet {
+			return true, errors.New("--color specified more than once")
+		}
+		mode, err := parseColorMode(strings.TrimPrefix(arg, "--color="))
+		if err != nil {
+			return true, err
+		}
+		options.mode = mode
+		options.colorSet = true
+		return true, nil
+	case strings.HasPrefix(arg, "-"):
+		return true, fmt.Errorf("unknown flag %q", arg)
+	default:
+		return false, nil
+	}
+}
+
+func setBlameFlag(name string, value *bool) error {
+	if *value {
+		return fmt.Errorf("%s specified more than once", name)
+	}
+	*value = true
+	return nil
 }
 
 // writeBlameText prints one aligned row per line. The label column is sized
 // from the widest label so a long human-override label cannot push the line
 // numbers out of alignment.
-func writeBlameText(out io.Writer, lines []provenance.BlameLine, color bool) {
+func writeBlameText(
+	out io.Writer,
+	lines []provenance.BlameLine,
+	sessions map[string]model.NoteSession,
+	color bool,
+	showTokens bool,
+) {
 	labels := make([]string, len(lines))
 	width := 0
 	for index, line := range lines {
-		labels[index] = line.Attribution.Label()
+		label := line.Attribution.Label()
+		if showTokens {
+			label += tokenSuffix(sessions, line.Attribution)
+		}
+		labels[index] = label
 		if count := utf8.RuneCountInString(labels[index]); count > width {
 			width = count
 		}
@@ -420,6 +457,34 @@ func writeBlameText(out io.Writer, lines []provenance.BlameLine, color bool) {
 		}
 		fmt.Fprintf(out, "%s %s %s\n", label, number, line.Content)
 	}
+}
+
+// tokenSuffix renders the session token usage of one attribution as a
+// compact bracket, such as [120i/34o], with cache counts only when nonzero.
+// Lines without an attributed agent session carry no suffix, so the plain
+// text path and the color path stay identical in content.
+func tokenSuffix(sessions map[string]model.NoteSession, attribution model.Attribution) string {
+	if attribution.Agent == "" || attribution.Session == "" {
+		return ""
+	}
+	session, ok := sessions[model.NoteSessionKey(attribution.Agent, attribution.Session)]
+	if !ok {
+		return ""
+	}
+	if !session.HasTokenUsage() {
+		return ""
+	}
+	parts := []string{
+		strconv.FormatUint(session.TokensIn, 10) + "i",
+		strconv.FormatUint(session.TokensOut, 10) + "o",
+	}
+	if session.CacheRead > 0 {
+		parts = append(parts, strconv.FormatUint(session.CacheRead, 10)+"cr")
+	}
+	if session.CacheWrite > 0 {
+		parts = append(parts, strconv.FormatUint(session.CacheWrite, 10)+"cw")
+	}
+	return " [" + strings.Join(parts, "/") + "]"
 }
 
 func runStatus(env *Env, command *command, args []string) (int, error) {
@@ -609,9 +674,9 @@ func parseJSONFlag(args []string) (bool, []string, error) {
 	var rest []string
 	for _, arg := range args {
 		switch arg {
-		case "--json":
+		case jsonFlag:
 			if jsonOutput {
-				return false, nil, errors.New("--json specified more than once")
+				return false, nil, fmt.Errorf("%s specified more than once", jsonFlag)
 			}
 			jsonOutput = true
 		case "-h", "--help":
