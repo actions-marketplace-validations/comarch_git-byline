@@ -42,7 +42,7 @@ func coverageCaptureMigrationWriteError(t *testing.T) {
 	if err := os.MkdirAll(dataStore.Dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	legacy := []byte(`{"version":1,"notes_version":3,"pending":{"files":{}}}` + "\n")
+	legacy := []byte(`{"version":3,"notes_version":3,"pending":{"files":{}},"lanes":{}}` + "\n")
 	if err := os.WriteFile(dataStore.StatePath(), legacy, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -449,15 +449,15 @@ func coverageBlameNotedFileErrors(t *testing.T) {
 	}
 	blob := mustBlob(t, repo, head, coverageFile)
 	file := makeCoverageNote(blob).Files[coverageFile]
-	if _, err := blameNotedFile(repo, head, "../bad", blob, file); err == nil {
+	if _, err := blameNotedFile(repo, head, "../bad", blob, file, nil); err == nil {
 		t.Fatal("blameNotedFile accepted an escaping path")
 	}
 	fake := fakeRewriteRepo(t, root, "read-blob-error", "")
-	if _, err := blameNotedFile(fake, head, coverageFile, blob, file); err == nil {
+	if _, err := blameNotedFile(fake, head, coverageFile, blob, file, nil); err == nil {
 		t.Fatal("blameNotedFile accepted a blob read failure")
 	}
 	file.Ranges[0].End = 2
-	if _, err := blameNotedFile(repo, head, coverageFile, blob, file); err == nil {
+	if _, err := blameNotedFile(repo, head, coverageFile, blob, file, nil); err == nil {
 		t.Fatal("blameNotedFile accepted invalid ranges")
 	}
 }

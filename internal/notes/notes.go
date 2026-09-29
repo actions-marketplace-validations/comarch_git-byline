@@ -24,7 +24,105 @@ const (
 	MaxFiles = 500
 )
 
-type noteSession = model.NoteSession
+type noteSession struct {
+	model.NoteSession
+	hasTokenUsageField bool
+}
+
+var tokenUsageFields = map[string]struct{}{
+	"tokens_in":   {},
+	"tokens_out":  {},
+	"cache_read":  {},
+	"cache_write": {},
+}
+
+func (session *noteSession) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&session.NoteSession); err != nil {
+		return err
+	}
+	for name := range tokenUsageFields {
+		if _, ok := fields[name]; ok {
+			session.hasTokenUsageField = true
+			break
+		}
+	}
+	return nil
+}
+
+type noteWire struct {
+	Version  int                       `json:"version"`
+	Files    map[string]model.NoteFile `json:"files"`
+	Sessions map[string]*noteSession   `json:"sessions"`
+}
+
+func decodeNoteWire(data []byte, version int) (noteWire, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var wire noteWire
+	if version == model.NoteVersionV1 {
+		var legacy struct {
+			Version int                       `json:"version"`
+			Files   map[string]model.NoteFile `json:"files"`
+		}
+		if err := decoder.Decode(&legacy); err != nil {
+			return noteWire{}, fmt.Errorf("decode note: %w", err)
+		}
+		wire.Version = legacy.Version
+		wire.Files = legacy.Files
+	} else if err := decoder.Decode(&wire); err != nil {
+		return noteWire{}, fmt.Errorf("decode note: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return noteWire{}, errors.New("multiple JSON values in note")
+		}
+		return noteWire{}, fmt.Errorf("decode note tail: %w", err)
+	}
+	if wire.Version != version {
+		return noteWire{}, fmt.Errorf(
+			"note version changed during decode from %d to %d",
+			version,
+			wire.Version,
+		)
+	}
+	return wire, nil
+}
+
+func decodeNoteSessions(
+	version int,
+	sessions map[string]*noteSession,
+) (map[string]model.NoteSession, error) {
+	for name, session := range sessions {
+		if session == nil {
+			return nil, fmt.Errorf("decode note session %q: session must be an object", name)
+		}
+	}
+	if version < model.NoteVersionV2 {
+		return nil, nil
+	}
+	decoded := make(map[string]model.NoteSession, len(sessions))
+	for name, session := range sessions {
+		if err := validateSession(name, session.NoteSession); err != nil {
+			return nil, err
+		}
+		if version < model.NoteVersion && session.hasTokenUsageField {
+			return nil, fmt.Errorf(
+				"note session %q carries token usage, which requires version %d",
+				name,
+				model.NoteVersion,
+			)
+		}
+		decoded[name] = session.NoteSession
+	}
+	return decoded, nil
+}
 
 // Encode returns canonical JSON with a trailing newline.
 func Encode(note model.Note) ([]byte, error) {
@@ -68,55 +166,20 @@ func Decode(data []byte) (model.Note, error) {
 		return model.Note{}, fmt.Errorf("decode note header: %w", err)
 	}
 	switch header.Version {
-	case model.NoteVersionV1, model.NoteVersionV2, model.NoteVersion:
+	case model.NoteVersionV1, model.NoteVersionV2, model.NoteVersionV3, model.NoteVersion:
 	default:
 		return model.Note{}, fmt.Errorf("unsupported note version %d", header.Version)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var wire struct {
-		Version  int                       `json:"version"`
-		Files    map[string]model.NoteFile `json:"files"`
-		Sessions map[string]*noteSession   `json:"sessions"`
+	wire, err := decodeNoteWire(data, header.Version)
+	if err != nil {
+		return model.Note{}, err
 	}
-	if header.Version == model.NoteVersionV1 {
-		var legacy struct {
-			Version int                       `json:"version"`
-			Files   map[string]model.NoteFile `json:"files"`
-		}
-		if err := decoder.Decode(&legacy); err != nil {
-			return model.Note{}, fmt.Errorf("decode note: %w", err)
-		}
-		wire.Version = legacy.Version
-		wire.Files = legacy.Files
-	} else if err := decoder.Decode(&wire); err != nil {
-		return model.Note{}, fmt.Errorf("decode note: %w", err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return model.Note{}, errors.New("multiple JSON values in note")
-		}
-		return model.Note{}, fmt.Errorf("decode note tail: %w", err)
-	}
-	if wire.Version != header.Version {
-		return model.Note{}, fmt.Errorf("note version changed during decode from %d to %d", header.Version, wire.Version)
-	}
-	for name, session := range wire.Sessions {
-		if session == nil {
-			return model.Note{}, fmt.Errorf("decode note session %q: session must be an object", name)
-		}
+	sessions, err := decodeNoteSessions(wire.Version, wire.Sessions)
+	if err != nil {
+		return model.Note{}, err
 	}
 	note := model.Note{Version: wire.Version, Files: wire.Files}
-	if wire.Version >= model.NoteVersionV2 {
-		note.Sessions = make(map[string]model.NoteSession, len(wire.Sessions))
-		for name, session := range wire.Sessions {
-			if err := validateSession(name, *session); err != nil {
-				return model.Note{}, err
-			}
-			note.Sessions[name] = *session
-		}
-	}
+	note.Sessions = sessions
 	if note.Files == nil {
 		note.Files = map[string]model.NoteFile{}
 	}
@@ -195,6 +258,13 @@ func validateNote(note model.Note) error {
 		if err := validateSession(name, session); err != nil {
 			return err
 		}
+		if note.Version < model.NoteVersion && session.HasTokenUsage() {
+			return fmt.Errorf(
+				"note session %q carries token usage, which requires version %d",
+				name,
+				model.NoteVersion,
+			)
+		}
 	}
 	paths := make([]string, 0, len(note.Files))
 	for path := range note.Files {
@@ -220,14 +290,14 @@ func validateNote(note model.Note) error {
 		if err := model.ValidateRanges(file.Ranges, lineCount); err != nil {
 			return fmt.Errorf("note file %q: %w", path, err)
 		}
-		if note.Version < model.NoteVersion {
+		if note.Version < model.NoteVersionV3 {
 			for index, value := range file.Ranges {
 				if value.Identity != "" {
 					return fmt.Errorf(
 						"note file %q range %d carries a human identity, which requires version %d",
 						path,
 						index,
-						model.NoteVersion,
+						model.NoteVersionV3,
 					)
 				}
 			}
@@ -295,6 +365,24 @@ func validateSession(name string, session model.NoteSession) error {
 	}
 	for _, field := range []struct {
 		name  string
+		value uint64
+	}{
+		{"tokens_in", session.TokensIn},
+		{"tokens_out", session.TokensOut},
+		{"cache_read", session.CacheRead},
+		{"cache_write", session.CacheWrite},
+	} {
+		if field.value > model.MaxCheckpointUsageTokens {
+			return fmt.Errorf(
+				"note session %q %s exceeds %d tokens",
+				name,
+				field.name,
+				model.MaxCheckpointUsageTokens,
+			)
+		}
+	}
+	for _, field := range []struct {
+		name  string
 		value string
 	}{
 		{"first_ts", session.FirstTS},
@@ -311,19 +399,21 @@ func validateSession(name string, session model.NoteSession) error {
 }
 
 // FindFile walks first-parent history to find attribution for the exact blob.
-func FindFile(repo *gitcmd.Repo, start, path, blob string) (model.NoteFile, bool, []string, error) {
+// It returns the whole note that carries the file, so callers can reuse its
+// session metrics.
+func FindFile(repo *gitcmd.Repo, start, path, blob string) (model.Note, bool, []string, error) {
 	if start == "" {
-		return model.NoteFile{}, false, nil, nil
+		return model.Note{}, false, nil, nil
 	}
 	history, err := repo.FirstParentHistory(start)
 	if err != nil {
-		return model.NoteFile{}, false, nil, err
+		return model.Note{}, false, nil, err
 	}
 	var warnings []string
 	for _, commit := range history {
 		data, ok, err := repo.ReadNote(commit)
 		if err != nil {
-			return model.NoteFile{}, false, warnings, err
+			return model.Note{}, false, warnings, err
 		}
 		if !ok {
 			continue
@@ -338,9 +428,9 @@ func FindFile(repo *gitcmd.Repo, start, path, blob string) (model.NoteFile, bool
 			continue
 		}
 		if file.Blob != blob {
-			return model.NoteFile{}, false, append(warnings, fmt.Sprintf("attribution blob mismatch for %s", path)), nil
+			return model.Note{}, false, append(warnings, fmt.Sprintf("attribution blob mismatch for %s", path)), nil
 		}
-		return file, true, warnings, nil
+		return note, true, warnings, nil
 	}
-	return model.NoteFile{}, false, warnings, nil
+	return model.Note{}, false, warnings, nil
 }
