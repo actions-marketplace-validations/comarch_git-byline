@@ -18,9 +18,10 @@ It runs with `CGO_ENABLED=0` and `GOPROXY=off`.
 5. CGO-free builds for Linux, macOS, and Windows on amd64 and arm64.
 6. Standard-library-only dependency policy.
 7. Forbidden production import policy.
-8. Installer syntax, checksum flow, marketplace JSON, and plugin license
-   checks.
-9. PromptScript 1.19.1 strict validation and generated output drift check.
+8. Installer syntax, checksum flow, marketplace JSON, plugin license, and
+   OpenCode plugin pin checks.
+9. PromptScript 1.19.1 strict validation and generated output drift check,
+   including the bounded OpenCode plugin patch and instructions.
 10. Repository scans for credentials, unfinished markers, private paths, and
    forbidden dash characters.
 
@@ -57,6 +58,11 @@ Validate PromptScript
 `Quality and build` aggregates the operating system test matrix and verified
 GoReleaser snapshot. The snapshot must contain six archives, six SPDX JSON
 SBOM files, and a non-empty SHA256 checksum file.
+
+`Validate PromptScript` compiles every build profile and target, applies the
+OpenCode plugin and subagent patch with
+`go run ./tools/validate -patch-opencode`, and fails on any difference from
+the committed files.
 
 Nightly robustness repeats randomized attribution scenarios and fuzzes line
 splitting and hook payload parsing. Nightly checks are not branch requirements

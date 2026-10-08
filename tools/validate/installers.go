@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,6 +69,7 @@ func checkInstallers(root string) error {
 		"--git-template",
 		"install-hooks --agent",
 		"marketplace/harness",
+		"detected opencode",
 	} {
 		if !strings.Contains(string(shell), required) {
 			return fmt.Errorf("install.sh is missing %q", required)
@@ -81,6 +84,9 @@ func checkInstallers(root string) error {
 		if !strings.Contains(string(powerShell), required) {
 			return fmt.Errorf("install.ps1 is missing %q", required)
 		}
+	}
+	if strings.Contains(string(powerShell), `Command = "opencode"`) {
+		return errors.New("install.ps1 must not advertise OpenCode plugin installation")
 	}
 	if sh, err := exec.LookPath("sh"); err == nil {
 		if _, err := runCapture(sh, root, "-n", shellPath); err != nil {
@@ -166,25 +172,34 @@ func checkPluginManifests(root string) error {
 // mirrors. Users copy the template into their own project, so a template that
 // drifts from the generated hook would install a stale hook body.
 var harnessTemplates = map[string]string{
-	filepath.Join("marketplace", "harness", "copilot", "hooks.json"):   filepath.Join(".github", "hooks", "promptscript.json"),
-	filepath.Join("marketplace", "harness", "vscode", "hooks.json"):    filepath.Join(".github", "hooks", "promptscript-vscode.json"),
-	filepath.Join("marketplace", "harness", "cursor", "hooks.json"):    filepath.Join(".cursor", "hooks.json"),
-	filepath.Join("marketplace", "harness", "codex", "hooks.json"):     filepath.Join(".codex", "hooks.json"),
-	filepath.Join("marketplace", "harness", "windsurf", "hooks.json"):  filepath.Join(".windsurf", "hooks.json"),
-	filepath.Join("marketplace", "harness", "grok", "hooks.json"):      filepath.Join(".grok", "hooks", "promptscript.json"),
-	filepath.Join("marketplace", "harness", "gemini", "settings.json"): filepath.Join(".gemini", "settings.json"),
+	filepath.Join("marketplace", "harness", "copilot", "hooks.json"):       filepath.Join(".github", "hooks", "promptscript.json"),
+	filepath.Join("marketplace", "harness", "vscode", "hooks.json"):        filepath.Join(".github", "hooks", "promptscript-vscode.json"),
+	filepath.Join("marketplace", "harness", "cursor", "hooks.json"):        filepath.Join(".cursor", "hooks.json"),
+	filepath.Join("marketplace", "harness", "codex", "hooks.json"):         filepath.Join(".codex", "hooks.json"),
+	filepath.Join("marketplace", "harness", "windsurf", "hooks.json"):      filepath.Join(".windsurf", "hooks.json"),
+	filepath.Join("marketplace", "harness", "grok", "hooks.json"):          filepath.Join(".grok", "hooks", "promptscript.json"),
+	filepath.Join("marketplace", "harness", "opencode", "promptscript.ts"): filepath.Join(".opencode", "plugins", "promptscript.ts"),
+	filepath.Join("marketplace", "harness", "gemini", "settings.json"):     filepath.Join(".gemini", "settings.json"),
 }
+
+// setupCommandFile is the file name of the setup command of most agents.
+const setupCommandFile = "git-byline-setup.md"
+
+// openCodeSetupCommand is the one setup command whose plugin target is
+// Unix-only, so it must keep the WSL path for Windows users.
+var openCodeSetupCommand = filepath.Join("marketplace", "harness", "opencode", setupCommandFile)
 
 // setupCommands lists every agent-facing setup command shipped by the
 // repository. Each one must describe the same verified installation.
 var setupCommands = []string{
-	filepath.Join("marketplace", "git-byline", "commands", "git-byline-setup.md"),
+	filepath.Join("marketplace", "git-byline", "commands", setupCommandFile),
 	filepath.Join("marketplace", "harness", "copilot", "git-byline-setup.prompt.md"),
 	filepath.Join("marketplace", "harness", "vscode", "git-byline-setup.prompt.md"),
-	filepath.Join("marketplace", "harness", "cursor", "git-byline-setup.md"),
-	filepath.Join("marketplace", "harness", "codex", "git-byline-setup.md"),
-	filepath.Join("marketplace", "harness", "windsurf", "git-byline-setup.md"),
-	filepath.Join("marketplace", "harness", "grok", "git-byline-setup.md"),
+	filepath.Join("marketplace", "harness", "cursor", setupCommandFile),
+	filepath.Join("marketplace", "harness", "codex", setupCommandFile),
+	filepath.Join("marketplace", "harness", "windsurf", setupCommandFile),
+	filepath.Join("marketplace", "harness", "grok", setupCommandFile),
+	openCodeSetupCommand,
 	filepath.Join("commands", "git-byline-setup.toml"),
 }
 
@@ -203,32 +218,165 @@ func checkHarnessTemplates(root string) error {
 		}
 	}
 	for _, rel := range setupCommands {
-		data, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			return fmt.Errorf("read setup command %s: %w", rel, err)
+		if err := checkSetupCommand(root, rel); err != nil {
+			return err
 		}
-		text := string(data)
-		for _, required := range []string{
-			"install.sh",
-			"install.ps1",
-			"--no-git-hook",
-			"install-hooks",
-			"status",
-		} {
-			if !strings.Contains(text, required) {
-				return fmt.Errorf("setup command %s is missing %q", rel, required)
-			}
+	}
+	return nil
+}
+
+// checkSetupCommand holds one setup command to the verified installation.
+func checkSetupCommand(root, rel string) error {
+	data, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		return fmt.Errorf("read setup command %s: %w", rel, err)
+	}
+	text := string(data)
+	for _, required := range []string{
+		"install.sh",
+		"install.ps1",
+		"--no-git-hook",
+		"install-hooks",
+		"status",
+	} {
+		if !strings.Contains(text, required) {
+			return fmt.Errorf("setup command %s is missing %q", rel, required)
 		}
-		// The commands tell the agent never to use sudo, so match an
-		// invocation rather than the word.
-		if sudoInvocation.MatchString(text) {
-			return fmt.Errorf("setup command %s must not use sudo", rel)
+	}
+	// The commands tell the agent never to use sudo, so match an
+	// invocation rather than the word.
+	if sudoInvocation.MatchString(text) {
+		return fmt.Errorf("setup command %s must not use sudo", rel)
+	}
+	for _, block := range powerShellBlock.FindAllStringSubmatch(text, -1) {
+		if powerShellCurlAlias.MatchString(block[1]) {
+			return fmt.Errorf("setup command %s uses the PowerShell curl alias, use irm or curl.exe", rel)
+		}
+	}
+	if rel == openCodeSetupCommand {
+		if !strings.Contains(text, "WSL") {
+			return fmt.Errorf("setup command %s must document the WSL path for Windows", rel)
+		}
+		if err := checkOpenCodePluginPin(root, text); err != nil {
+			return fmt.Errorf("setup command %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// releasePinMarker tags a line whose release tag Release Please rewrites on
+// every release.
+const releasePinMarker = "x-release-please-version"
+
+var (
+	releaseTagPattern   = regexp.MustCompile(`v[0-9]+\.[0-9]+\.[0-9]+`)
+	sha256DigestPattern = regexp.MustCompile(`\b[0-9a-f]{64}\b`)
+
+	// openCodePluginURL captures the ref of a URL of the plugin, in both the
+	// raw.githubusercontent.com and the github.com/raw forms. The ref can span
+	// segments, as in refs/heads/main, so any ref but the pin fails.
+	openCodePluginURL = regexp.MustCompile(
+		`/comarch/git-byline/(?:raw/)?([^\s"']+?)/marketplace/harness/opencode/promptscript\.ts`,
+	)
+)
+
+// checkOpenCodePluginPin keeps the plugin install of the OpenCode setup
+// command safe to run. OpenCode loads every file of .opencode/plugins as
+// code, so the command must download the plugin from a release tag, never
+// from a branch, and must compare the download with the SHA-256 of the plugin
+// this repository ships before the file reaches that directory. Release
+// Please rewrites the tag on every release, so it must follow the manifest,
+// like the pin of the CI templates.
+func checkOpenCodePluginPin(root, setup string) error {
+	if err := checkOpenCodeReleasePin(root, setup); err != nil {
+		return err
+	}
+	if err := checkOpenCodePluginURLs(setup); err != nil {
+		return err
+	}
+	return checkOpenCodePluginDigest(root, setup)
+}
+
+// checkOpenCodeReleasePin requires every marked pin line to hold the version
+// of the release manifest.
+func checkOpenCodeReleasePin(root, setup string) error {
+	version, err := releaseManifestVersion(root)
+	if err != nil {
+		return err
+	}
+	pins := 0
+	for _, line := range strings.Split(setup, "\n") {
+		if !strings.Contains(line, releasePinMarker) {
+			continue
+		}
+		tags := releaseTagPattern.FindAllString(line, -1)
+		if len(tags) != 1 {
+			return fmt.Errorf("release pin line must hold one release tag, found %d", len(tags))
+		}
+		if tags[0] != "v"+version {
+			return fmt.Errorf("release pin is %s, release manifest is v%s", tags[0], version)
+		}
+		pins++
+	}
+	if pins == 0 {
+		return fmt.Errorf("has no release pin line marked %s", releasePinMarker)
+	}
+	return nil
+}
+
+// checkOpenCodePluginURLs requires every download of the plugin to use the
+// release pin as its ref.
+func checkOpenCodePluginURLs(setup string) error {
+	downloads := openCodePluginURL.FindAllStringSubmatch(setup, -1)
+	if len(downloads) == 0 {
+		return errors.New("does not download the plugin from the release pin")
+	}
+	for _, download := range downloads {
+		if download[1] != "$tag" {
+			return fmt.Errorf("downloads the plugin from %s, want the release pin $tag", download[1])
+		}
+	}
+	return nil
+}
+
+// checkOpenCodePluginDigest requires the setup command to verify the download
+// with the SHA-256 of the plugin this repository ships.
+func checkOpenCodePluginDigest(root, setup string) error {
+	for _, tool := range []string{"sha256sum", "shasum -a 256", "Get-FileHash"} {
+		if !strings.Contains(setup, tool) {
+			return fmt.Errorf("does not verify the plugin with %s", tool)
+		}
+	}
+	plugin, err := os.ReadFile(filepath.Join(root, openCodeTemplateRel))
+	if err != nil {
+		return fmt.Errorf("read OpenCode plugin: %w", err)
+	}
+	// Git serves the committed bytes, which hold no CR, while a Windows
+	// checkout may convert line endings.
+	sum := sha256.Sum256(bytes.ReplaceAll(plugin, []byte("\r\n"), []byte("\n")))
+	want := hex.EncodeToString(sum[:])
+	// The sh block compares the digest as text, and sha256sum prints lowercase.
+	digests := sha256DigestPattern.FindAllString(setup, -1)
+	if len(digests) == 0 {
+		return errors.New("lists no lowercase SHA-256 of the plugin")
+	}
+	for _, digest := range digests {
+		if digest != want {
+			return fmt.Errorf("lists SHA-256 %s, but %s hashes to %s", digest, filepath.ToSlash(openCodeTemplateRel), want)
 		}
 	}
 	return nil
 }
 
 var sudoInvocation = regexp.MustCompile(`(?m)(^|[\s;&|(])sudo\s`)
+
+// powerShellBlock captures the body of a fenced PowerShell example.
+var powerShellBlock = regexp.MustCompile("(?s)```powershell\n(.*?)```")
+
+// powerShellCurlAlias matches bare curl with flags. Windows PowerShell binds
+// that name to Invoke-WebRequest, which rejects the flags the sh examples use.
+// curl.exe is the real tool and does not match.
+var powerShellCurlAlias = regexp.MustCompile(`(?m)(^|[\s;&|(])curl\s+-`)
 
 func readJSONObject(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)

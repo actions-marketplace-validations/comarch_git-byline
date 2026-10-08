@@ -5,8 +5,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
+)
+
+// agentToolsPattern captures every agent of agents.prs with its tools list.
+var agentToolsPattern = regexp.MustCompile(
+	`(?m)^  ([a-z-]+): \{\r?\n    description: [^\r\n]*\r?\n    tools: (\[[^\]\r\n]*\])\r?$`,
 )
 
 func TestParseSemver(t *testing.T) {
@@ -173,5 +180,98 @@ func TestCheckDriftMissingGeneratedFile(t *testing.T) {
 	err = checkDrift(bin, dir)
 	if err == nil {
 		t.Fatal("checkDrift(empty dir) = nil, want error")
+	}
+}
+
+// TestCommittedOpenCodePluginIsPatchOutput pins that the plugin and its
+// harness template are what the patch produces. CI compiles, patches, and
+// then runs git diff, and the patch rejects a file that still holds code it
+// replaces, so a leftover in either committed file fails here first.
+func TestCommittedOpenCodePluginIsPatchOutput(t *testing.T) {
+	t.Parallel()
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("repoRoot: %v", err)
+	}
+	for _, rel := range []string{openCodePluginRel, openCodeTemplateRel} {
+		plugin, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Windows checkouts may convert line endings.
+		text := strings.ReplaceAll(string(plugin), "\r\n", "\n")
+		again, err := patchOpenCodePlugin([]byte(text))
+		if err != nil {
+			t.Errorf("patch %s: %v", rel, err)
+			continue
+		}
+		if string(again) != text {
+			t.Errorf("%s is not patch output, run go run ./tools/validate -patch-opencode after compiling", rel)
+		}
+	}
+}
+
+// TestOpenCodeAgentsMatchTheirPromptScriptSource pins what the read-only
+// permission block assumes. PromptScript drops the tools list of an agent
+// when it writes an OpenCode subagent, so the patch grants Read, Grep, and
+// Glob to every subagent. A source agent with other tools, or a subagent the
+// patch does not know, would silently get the wrong permissions.
+func TestOpenCodeAgentsMatchTheirPromptScriptSource(t *testing.T) {
+	t.Parallel()
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("repoRoot: %v", err)
+	}
+	source, err := os.ReadFile(filepath.Join(root, ".promptscript", "agents.prs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sourceNames []string
+	for _, agent := range agentToolsPattern.FindAllStringSubmatch(string(source), -1) {
+		sourceNames = append(sourceNames, agent[1])
+		if want := `["Read", "Grep", "Glob"]`; agent[2] != want {
+			t.Errorf("agent %s lists tools %s, but the OpenCode permission block grants %s", agent[1], agent[2], want)
+		}
+	}
+	patched := slices.Clone(openCodeAgentNames)
+	slices.Sort(sourceNames)
+	slices.Sort(patched)
+	if !slices.Equal(sourceNames, patched) {
+		t.Fatalf("agents.prs defines %v, but the OpenCode patch covers %v", sourceNames, patched)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(root, openCodeDir, "agents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var committed []string
+	for _, entry := range entries {
+		committed = append(committed, strings.TrimSuffix(entry.Name(), ".md"))
+	}
+	slices.Sort(committed)
+	if !slices.Equal(committed, patched) {
+		t.Fatalf("%s holds %v, want %v", filepath.Join(openCodeDir, "agents"), committed, patched)
+	}
+	for _, name := range patched {
+		agent, err := os.ReadFile(filepath.Join(root, openCodeAgentRel(name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Windows checkouts may convert line endings.
+		text := strings.ReplaceAll(string(agent), "\r\n", "\n")
+		if !strings.Contains(text, openCodeAgentReadOnly) {
+			t.Errorf("%s lacks the read-only permission block", openCodeAgentRel(name))
+		}
+		// CI compiles, patches, and then runs git diff. The drift check ignores
+		// stamps, so only an agent that the patch leaves unchanged survives
+		// that diff.
+		again, err := patchOpenCodeAgent([]byte(text))
+		if err != nil {
+			t.Errorf("patch %s: %v", openCodeAgentRel(name), err)
+			continue
+		}
+		if string(again) != text {
+			t.Errorf("%s is not patch output, run go run ./tools/validate -patch-opencode after compiling", openCodeAgentRel(name))
+		}
 	}
 }

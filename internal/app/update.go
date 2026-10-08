@@ -673,6 +673,15 @@ const (
 	agentFlag           = "--agent"
 )
 
+// hooksSourceFile is the harness file of every agent that reads a hooks.json
+// style project hook file.
+const hooksSourceFile = "hooks.json"
+
+// openCodeAgent names the manual agent that loads a plugin instead of a hook
+// file. The plugin is unverified on Windows, and install.sh looks for the
+// agent in the XDG config directory.
+const openCodeAgent = "opencode"
+
 // userAgent is one agent git-byline configures itself at user level, so
 // the update refresh matches the installer's detection.
 type userAgent struct {
@@ -690,21 +699,23 @@ var userAgents = []userAgent{
 // manualAgent is one agent git-byline cannot configure itself; the
 // update prints the same single copy command the installer prints.
 type manualAgent struct {
-	name      string
-	command   string
-	configDir string
-	hookPath  string
+	name       string
+	command    string
+	configDir  string
+	hookPath   string
+	sourceFile string
 }
 
 // manualAgents mirrors the installer's per-project hook list; keep it in
 // lockstep with install.sh.
 var manualAgents = []manualAgent{
-	{name: "gemini", command: "gemini", configDir: ".gemini", hookPath: ".gemini/settings.json"},
-	{name: "cursor", command: "cursor", configDir: ".cursor", hookPath: ".cursor/hooks.json"},
-	{name: "codex", command: "codex", configDir: ".codex", hookPath: ".codex/hooks.json"},
-	{name: "windsurf", command: "windsurf", configDir: ".codeium", hookPath: ".windsurf/hooks.json"},
-	{name: "copilot", command: "code", configDir: ".vscode", hookPath: ".github/hooks/promptscript.json"},
-	{name: "grok", command: "grok", configDir: ".grok", hookPath: ".grok/hooks/promptscript.json"},
+	{name: "gemini", command: "gemini", configDir: ".gemini", hookPath: ".gemini/settings.json", sourceFile: "settings.json"},
+	{name: "cursor", command: "cursor", configDir: ".cursor", hookPath: ".cursor/hooks.json", sourceFile: hooksSourceFile},
+	{name: "codex", command: "codex", configDir: ".codex", hookPath: ".codex/hooks.json", sourceFile: hooksSourceFile},
+	{name: "windsurf", command: "windsurf", configDir: ".codeium", hookPath: ".windsurf/hooks.json", sourceFile: hooksSourceFile},
+	{name: "copilot", command: "code", configDir: ".vscode", hookPath: ".github/hooks/promptscript.json", sourceFile: hooksSourceFile},
+	{name: "grok", command: "grok", configDir: ".grok", hookPath: ".grok/hooks/promptscript.json", sourceFile: hooksSourceFile},
+	{name: openCodeAgent, command: openCodeAgent, hookPath: ".opencode/plugins/promptscript.ts", sourceFile: "promptscript.ts"},
 }
 
 // refreshHooks converges managed hooks after a binary swap, mirroring the
@@ -735,23 +746,52 @@ func refreshHooks(env *Env, target string, detect func(command, configDir string
 		}
 		fmt.Fprintf(env.Stdout, "Installed the %s hook for every repository.\n", agent.name)
 	}
-	pending := []manualAgent{}
-	for _, agent := range manualAgents {
-		if detect(agent.command, agent.configDir) {
-			pending = append(pending, agent)
-		}
-	}
+	pending := detectManualAgents(runtime.GOOS, detect)
 	if len(pending) == 0 {
 		return
 	}
-	fmt.Fprintln(env.Stdout, "Detected agents that need one hook file per project:")
+	fmt.Fprintln(env.Stdout, "Detected agents that need one project integration file:")
 	for _, agent := range pending {
 		fmt.Fprintf(env.Stdout, "  %-14s curl -fsSL --proto =https --tlsv1.2 -o %s --create-dirs \\\n", agent.name, agent.hookPath)
 		fmt.Fprintf(env.Stdout, "                   %s/raw/main/marketplace/harness/%s/%s\n",
-			updateRepository, agent.name, filepath.Base(agent.hookPath))
+			updateRepository, agent.name, agent.sourceFile)
 	}
 	fmt.Fprintln(env.Stdout, "Merge the block for gemini instead of replacing the file.")
 	fmt.Fprintf(env.Stdout, "Details: %s/blob/main/marketplace/harness/README.md\n", updateRepository)
+}
+
+// detectManualAgents returns the manual agents found on this machine, in list
+// order. goos is a parameter so tests reach the Windows skip on any platform.
+func detectManualAgents(goos string, detect func(command, configDir string) bool) []manualAgent {
+	found := []manualAgent{}
+	for _, agent := range manualAgents {
+		configDir := agent.configDir
+		if agent.name == openCodeAgent {
+			if goos == "windows" {
+				continue
+			}
+			configDir = openCodeConfigDir()
+		}
+		if detect(agent.command, configDir) {
+			found = append(found, agent)
+		}
+	}
+	return found
+}
+
+// openCodeConfigDir returns the OpenCode configuration directory the way
+// install.sh does: below XDG_CONFIG_HOME, or below ~/.config when it is
+// unset. It is empty when the home directory is unknown.
+func openCodeConfigDir() string {
+	configRoot := os.Getenv("XDG_CONFIG_HOME")
+	if configRoot == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		configRoot = filepath.Join(home, ".config")
+	}
+	return filepath.Join(configRoot, "opencode")
 }
 
 // refreshStep runs one install-hooks pass through the freshly installed

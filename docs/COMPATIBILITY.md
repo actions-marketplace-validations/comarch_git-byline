@@ -37,10 +37,11 @@ file, but interactive file switching requires JavaScript.
 | Gemini CLI | `portable-gemini` | Generated pre/post tool hooks | Common file and patch fields |
 | Windsurf | `portable-windsurf` | Generated write-event hooks | `tool_info` file and command fields |
 | Grok | `portable-grok` | Generated pre/post tool hooks | Common file and patch fields |
+| OpenCode | `portable-opencode` | Generated plugin for local `edit`, `write`, `apply_patch`, and `bash` tool calls | `tool`, `args`, `sessionID`, and `callID`; `apply_patch` body in `args.patchText` |
 | agent-v1 | `agent-v1` | Standard edit payload, `agent_name` required | `edited_filepaths` |
 
-Unknown valid tool events are ignored. Malformed supported events fail without
-writing a checkpoint.
+Unknown tool events are ignored. Malformed supported events fail or are
+ignored without writing a checkpoint.
 
 ## Model detection
 
@@ -58,6 +59,7 @@ per surface:
 | VS Code | none in hook payload; transcript read is unverified | Follow-up |
 | Copilot CLI | none in tool hook payloads | Upstream gap |
 | Grok | none in tool hook payloads | Upstream gap |
+| OpenCode | no model field in tool hook payloads | Checkpoints keep `unknown` |
 | agent-v1 | hook payload `model` field | By schema |
 
 Factory, Claude Code, Gemini CLI, VS Code, and Cursor payloads carry
@@ -79,7 +81,7 @@ portable preset reads both, including `trajectory_id` as the session and
 
 ## Shell attribution
 
-Shell hooks are supported for Droid, Claude Code, and the nine portable agent
+Shell hooks are supported for Droid, Claude Code, and the ten portable agent
 surfaces. The pre-shell checkpoint records the dirty worktree paths and their
 blob IDs. The post-shell checkpoint records only paths whose current blob
 differs from the pre-shell snapshot. Paths come from Git status in the
@@ -102,10 +104,34 @@ hook APIs. Other instruction targets can consume generated project guidance,
 but cannot provide edit-event attribution without an external watcher or
 daemon. git-byline does not add either.
 
-OpenCode is not currently integrated. OpenCode exposes plugin execution hooks,
-but the pinned PromptScript release does not generate an OpenCode hook plugin.
-Track native support in
-[PromptScript issue #454](https://github.com/mrwogu/promptscript/issues/454).
+OpenCode uses the generated `.opencode/plugins/promptscript.ts` plugin. It
+captures local `edit`, `write`, `apply_patch`, and `bash` tool calls through
+OpenCode's `tool.execute.before` and `tool.execute.after` events. The plugin
+payload provides `sessionID` and `callID`; git-byline uses the call ID to pair
+shell events. `apply_patch` carries its whole patch in `patchText`, and
+git-byline reads the touched file paths from the patch headers. When the
+payload is too large, the plugin keeps only those paths. OpenCode tool events
+do not provide the active model, so the model is recorded as `unknown`.
+PromptScript model profiles describe configured model names, not the model
+used by an individual tool call.
+
+PromptScript 1.19.1 declares this plugin target Unix-only. The generated code
+does not explicitly reject Windows, but git-byline has not verified native
+Windows plugin loading or process execution. Native Windows is unverified; the
+documented Windows path is to run OpenCode in WSL.
+
+OpenCode plugin hooks wait for their checkpoint process before OpenCode
+continues. The pre-edit snapshot exists before the tool writes, and the
+post-edit snapshot exists before the next tool starts. A hook that fails or
+runs past its 30 second limit is logged, and the tool call continues without
+that checkpoint. MCP calls, some subagent paths, and failed tool calls do not
+have dedicated plugin events. Attribution is best-effort on those paths, not
+guaranteed.
+
+OpenCode 1.18.33 skips project plugins when it runs with `--pure`, including
+this one. Such a session records no checkpoint, so its edits arrive as `human`
+lines. The plugin does load when a client attaches to `opencode serve`: the
+server process runs the hooks.
 
 ## Git behavior
 

@@ -71,17 +71,31 @@ environment dumps, or production data.
 
 Native instruction, agent, workflow, and hook files under `AGENTS.md`,
 `CLAUDE.md`, `GEMINI.md`, `.claude/`, `.codex/`, `.cursor/`, `.factory/`,
-`.gemini/`, `.github/agents/`, `.github/hooks/`, `.grok/`,
-`.promptscript/generated/`, and `.windsurf/` are generated from
-`.promptscript/`. Edit PromptScript sources, then:
+`.gemini/`, `.github/agents/`, `.github/hooks/`, `.grok/`, `.opencode/`,
+`.promptscript/generated/`, `.windsurf/`, and `OPENCODE.md` are generated
+from `.promptscript/`. Edit PromptScript sources, then:
 
 ```sh
 promptscript validate --strict .promptscript/project.prs
 promptscript compile --all-builds --force --strict
 promptscript compile --all --force --strict
+go run ./tools/validate -patch-opencode
 ```
 
-Review the generated diff. Never edit generated instruction files directly.
+The final command applies the git-byline patch to the generated OpenCode
+plugin (bounded file paths, `apply_patch` paths, and awaited hooks) and syncs
+its copyable harness template. It also adds a read-only `permission` block to
+the generated OpenCode subagents, because PromptScript does not carry their
+`tools` list into OpenCode. The block keeps OpenCode's default prompt before
+`.env` files. The patch also pins the generation time in the subagent stamps,
+because every compile would otherwise move it and leave a diff. Review the
+generated diff. Never edit generated instruction files directly.
+
+The OpenCode setup command, `marketplace/harness/opencode/git-byline-setup.md`,
+installs the plugin from a release tag and checks its SHA-256. When the plugin
+changes, `go run ./tools/validate` fails and prints the new digest. Copy it
+into both code blocks of the setup command. Leave the release tag alone,
+because Release Please rewrites it.
 
 Release Please owns `CHANGELOG.md`, release versions, release pull requests,
 and tags. Do not hand-edit release output except while bootstrapping an empty
